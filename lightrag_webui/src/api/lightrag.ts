@@ -4,6 +4,8 @@ import type { SupportedFileTypes } from '@/lib/fileTypes'
 import { errorMessage } from '@/lib/utils'
 import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/state'
+import { useKBStore } from '@/stores/kb'
+import { scopeUrlToActiveKb } from '@/api/kbScoping'
 import { navigationService } from '@/services/navigation'
 
 // Types
@@ -163,6 +165,12 @@ export type LightragStatus = {
  */
 export type QueryMode = 'naive' | 'local' | 'global' | 'hybrid' | 'mix' | 'bypass'
 
+export type Reference = {
+  reference_id: string
+  file_path: string
+  content?: string[]
+}
+
 export type Message = {
   role: 'user' | 'assistant' | 'system'
   content: string
@@ -171,6 +179,9 @@ export type Message = {
   thinkingTime?: number | null
   responseTime?: number | null
   firstTokenTime?: number | null
+  inputTokens?: number | null
+  outputTokens?: number | null
+  references?: Reference[]
 }
 
 export type QueryRequest = {
@@ -208,11 +219,34 @@ export type QueryRequest = {
   enable_rerank?: boolean
   /** If True, emits retrieval progress events and a final response-time metadata line (streaming only). Default: false. */
   include_progress?: boolean
+  /** If True, includes the reference (source) list in the response. */
+  include_references?: boolean
+  /** If True, includes the actual chunk text content inside each reference. */
+  include_chunk_content?: boolean
 }
 
 export type QueryResponse = {
   response: string
+  references?: Reference[]
   response_time?: number
+  input_tokens?: number
+  output_tokens?: number
+}
+
+export type MultiKBQueryRequest = QueryRequest & {
+  kbs: string[]
+}
+
+export type KBQueryResult = {
+  kb_id: string
+  kb_name: string
+  response: string
+  references: Reference[]
+}
+
+export type MultiKBQueryResponse = {
+  responses: KBQueryResult[]
+  all_references: Reference[]
 }
 
 export type EntityUpdateResponse = {
@@ -429,6 +463,7 @@ axiosInstance.interceptors.request.use((config) => {
   if (apiKey) {
     config.headers['X-API-Key'] = apiKey
   }
+  config.url = scopeUrlToActiveKb(config.url, useKBStore.getState().activeKbId)
   return config
 })
 
@@ -575,6 +610,17 @@ export const getSupportedFileTypes = async (signal?: AbortSignal): Promise<Suppo
   return response.data
 }
 
+export type ChunkingDefaults = {
+  strategy: string
+  chunk_token_size: number
+  chunk_overlap_token_size: number
+}
+
+export const getChunkingDefaults = async (signal?: AbortSignal): Promise<ChunkingDefaults> => {
+  const response = await axiosInstance.get('/chunking-defaults', { signal })
+  return response.data
+}
+
 export const scanNewDocuments = async (): Promise<ScanResponse> => {
   const response = await axiosInstance.post('/documents/scan')
   return response.data
@@ -615,7 +661,9 @@ async function _readNdjsonStream(
   onChunk: (chunk: string) => void,
   onError: ((error: string) => void) | undefined,
   onResponseTime?: (seconds: number) => void,
-  onProgress?: (event: string) => void
+  onProgress?: (event: string) => void,
+  onReferences?: (refs: Reference[]) => void,
+  onTokenUsage?: (contextTokens: number, outputTokens: number) => void
 ): Promise<void> {
   if (!response.body) {
     throw new Error('Response body is null');
@@ -648,11 +696,17 @@ async function _readNdjsonStream(
             onError?.(parsed.error);
           } else if (parsed.response_time !== undefined && onResponseTime) {
             onResponseTime(parsed.response_time);
+            if (onTokenUsage && parsed.input_tokens !== undefined && parsed.output_tokens !== undefined) {
+              onTokenUsage(parsed.input_tokens, parsed.output_tokens);
+            }
           } else if (parsed.progress && onProgress) {
             onProgress(parsed.progress);
+          } else if (parsed.references) {
+            // references-only lines (first NDJSON line when
+            // include_references=True) are surfaced to the caller so the UI
+            // can render retrieved sources (incl. inline multimodal images).
+            onReferences?.(parsed.references);
           }
-          // references-only lines are silently consumed —
-          // the caller only cares about response chunks and errors.
         } catch {
           // Truncated or malformed JSON — log and skip the line so one
           // bad line does not kill the whole stream.
@@ -679,8 +733,13 @@ async function _readNdjsonStream(
         onError?.(parsed.error);
       } else if (parsed.response_time !== undefined && onResponseTime) {
         onResponseTime(parsed.response_time);
+        if (onTokenUsage && parsed.input_tokens !== undefined && parsed.output_tokens !== undefined) {
+          onTokenUsage(parsed.input_tokens, parsed.output_tokens);
+        }
       } else if (parsed.progress && onProgress) {
         onProgress(parsed.progress);
+      } else if (parsed.references) {
+        onReferences?.(parsed.references);
       }
     } catch {
       console.warn('Failed to parse final NDJSON buffer:', buffer.substring(0, 120));
@@ -790,12 +849,16 @@ export const queryTextStream = async (
   onError?: (error: string) => void,
   signal?: AbortSignal,
   onResponseTime?: (seconds: number) => void,
-  onProgress?: (event: string) => void
+  onProgress?: (event: string) => void,
+  onReferences?: (refs: Reference[]) => void,
+  onTokenUsage?: (contextTokens: number, outputTokens: number) => void
 ) => {
   const headers = _buildStreamHeaders();
 
+  const streamPath = scopeUrlToActiveKb('/query/stream', useKBStore.getState().activeKbId) ?? '/query/stream'
+
   try {
-    const response = await fetch(`${backendBaseUrl}/query/stream`, {
+    const response = await fetch(`${backendBaseUrl}${streamPath}`, {
       method: 'POST',
       headers,
       body: JSON.stringify(request),
@@ -826,7 +889,7 @@ export const queryTextStream = async (
             const retryHeaders: Record<string, string> = { ...(headers as Record<string, string>) };
             retryHeaders['Authorization'] = `Bearer ${newToken}`;
 
-            retryResponse = await fetch(`${backendBaseUrl}/query/stream`, {
+            retryResponse = await fetch(`${backendBaseUrl}${streamPath}`, {
               method: 'POST',
               headers: retryHeaders,
               body: JSON.stringify(request),
@@ -869,7 +932,7 @@ export const queryTextStream = async (
     }
 
     // --- Read the NDJSON stream (happy path or refreshed retry) ------------
-    await _readNdjsonStream(activeResponse, onChunk, onError, onResponseTime, onProgress);
+    await _readNdjsonStream(activeResponse, onChunk, onError, onResponseTime, onProgress, onReferences, onTokenUsage);
   } catch (error) {
     const classified = _classifyStreamError(error, signal);
     if (classified === null) {
@@ -879,6 +942,72 @@ export const queryTextStream = async (
     onError?.(classified);
   }
 };
+
+export const multiKBQuery = async (
+  request: MultiKBQueryRequest,
+  signal?: AbortSignal
+): Promise<MultiKBQueryResponse> => {
+  const response = await axiosInstance.post('/api/kbs/query', request, { signal })
+  return response.data
+}
+
+export const multiKBQueryStream = async (
+  request: MultiKBQueryRequest,
+  onChunk: (chunk: string) => void,
+  onError?: (error: string) => void,
+  signal?: AbortSignal,
+  onResponseTime?: (seconds: number) => void,
+  onProgress?: (event: string) => void,
+  onReferences?: (refs: Reference[]) => void,
+  onTokenUsage?: (contextTokens: number, outputTokens: number) => void
+): Promise<void> => {
+  const headers = _buildStreamHeaders()
+  const response = await fetch(`${backendBaseUrl}/api/kbs/query/stream`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ ...request, stream: true }),
+    signal,
+  })
+  if (!response.ok) {
+    await _throwStreamHttpError(response)
+  }
+  await _readNdjsonStream(response, onChunk, onError, onResponseTime, onProgress, onReferences, onTokenUsage)
+}
+
+/**
+ * Fetch a multimodal image (e.g. `/multimodal/{doc_stem}/{media_id}`) from the
+ * backend and return an object URL so it can be rendered without leaking the
+ * `X-API-Key` in a DOM `<img>` (browsers don't attach custom headers to image
+ * requests). The axios instance already injects `X-API-Key` / `Bearer` from the
+ * settings store, so the same auth path as every other API call is reused.
+ */
+export const fetchMultimodalBlob = async (url: string): Promise<string> => {
+  // The backend emits absolute URLs based on Request.base_url (often
+  // localhost:9621). The browser may access the WebUI through a different
+  // host/port (127.0.0.1, a LAN IP, or a reverse proxy), so requesting that
+  // exact absolute URL causes CORS/preflight failures and the blob never
+  // gets created. Strip scheme/host and always request the path through the
+  // configured axios instance, which uses backendBaseUrl and injects the
+  // X-API-Key/Bearer headers automatically.
+  let path = url
+  try {
+    const u = new URL(url)
+    path = u.pathname + u.search + u.hash
+  } catch {
+    // Already relative; use as-is.
+  }
+  try {
+    console.log('[fetchMultimodalBlob] fetching', path, 'original url was', url)
+    const response = await axiosInstance.get(path, { responseType: 'blob' })
+    const blob = response.data as Blob
+    const blobUrl = URL.createObjectURL(blob)
+    console.log('[fetchMultimodalBlob] created blob', blobUrl, 'size', blob.size, 'type', blob.type)
+    return blobUrl
+  } catch (err) {
+    console.error('[fetchMultimodalBlob] failed for', path, 'original url was', url, err)
+    throw err
+  }
+}
 
 export const insertText = async (text: string): Promise<DocActionResponse> => {
   const response = await axiosInstance.post('/documents/text', { text })
@@ -890,12 +1019,38 @@ export const insertTexts = async (texts: string[]): Promise<DocActionResponse> =
   return response.data
 }
 
+export type ChunkingStrategy = 'fixed_token' | 'recursive_character' | 'semantic_vector' | 'paragraph_semantic'
+
+export interface UploadChunkingOptions {
+  strategy?: ChunkingStrategy
+  chunkTokenSize?: number
+  chunkOverlapTokenSize?: number
+  splitByCharacter?: string
+  separators?: string[]
+}
+
 export const uploadDocument = async (
   file: File,
-  onUploadProgress?: (percentCompleted: number) => void
+  onUploadProgress?: (percentCompleted: number) => void,
+  chunkingOptions?: UploadChunkingOptions
 ): Promise<DocActionResponse> => {
   const formData = new FormData()
   formData.append('file', file)
+  if (chunkingOptions?.strategy) {
+    formData.append('chunking_strategy', chunkingOptions.strategy)
+  }
+  if (chunkingOptions?.chunkTokenSize != null) {
+    formData.append('chunk_token_size', String(chunkingOptions.chunkTokenSize))
+  }
+  if (chunkingOptions?.chunkOverlapTokenSize != null) {
+    formData.append('chunk_overlap_token_size', String(chunkingOptions.chunkOverlapTokenSize))
+  }
+  if (chunkingOptions?.splitByCharacter != null && chunkingOptions.splitByCharacter !== '') {
+    formData.append('split_by_character', chunkingOptions.splitByCharacter)
+  }
+  if (chunkingOptions?.separators != null && chunkingOptions.separators.length > 0) {
+    formData.append('separators', JSON.stringify(chunkingOptions.separators))
+  }
 
   const response = await axiosInstance.post('/documents/upload', formData, {
     headers: {

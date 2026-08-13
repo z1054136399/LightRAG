@@ -1,5 +1,5 @@
 import { ComponentProps, ReactNode, useEffect, useMemo, useRef, memo, useState } from 'react' // Import useMemo
-import { Message } from '@/api/lightrag'
+import { Message, type Reference, fetchMultimodalBlob } from '@/api/lightrag'
 import useTheme from '@/hooks/useTheme'
 import { cn } from '@/lib/utils'
 
@@ -11,14 +11,84 @@ import rehypeSanitize from 'rehype-sanitize'
 import remarkMath from 'remark-math'
 import mermaid from 'mermaid'
 import { remarkFootnotes } from '@/utils/remarkFootnotes'
-import { chatMarkdownSanitizeSchema } from '@/utils/markdownSanitizeSchema'
-
+import { chatMarkdownSanitizeSchema, referenceSanitizeSchema } from '@/utils/markdownSanitizeSchema'
 
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
 import { oneLight, oneDark } from 'react-syntax-highlighter/dist/cjs/styles/prism'
 
-import { LoaderIcon, ChevronDownIcon, ClockIcon, ZapIcon } from 'lucide-react'
+import { LoaderIcon, ChevronDownIcon, ClockIcon, ZapIcon, FileIcon, HashIcon } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
+
+// Cache resolved blob URLs so re-renders — including the brief empty-src churn
+// that happens while references are swapped — reuse the same object URL instead
+// of re-fetching, or worse, revoking a still-displayed image and going blank.
+const multimodalBlobCache = new Map<string, string>()
+
+// Resolves a possibly-keyed /multimodal/ image URL to a same-origin blob: URL
+// (fetched through the authenticated axios client) so it can render in the chat
+// answer without a 401. Falls back to a plain <img> for any other src.
+const MultimodalImg = memo(function MultimodalImg({
+  src,
+  alt,
+  title,
+}: {
+  src?: string
+  alt?: string
+  title?: string
+}) {
+  const isMultimodal = typeof src === 'string' && src.includes('/multimodal/')
+  const [blobUrl, setBlobUrl] = useState<string | null>(
+    isMultimodal && src ? multimodalBlobCache.get(src) ?? null : null
+  )
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    if (!isMultimodal || !src) {
+      // Non-multimodal or transiently-empty src: clear the view but DO NOT
+      // revoke a cached blob — it may still be needed on the next render.
+      setBlobUrl(null)
+      setFailed(false)
+      return
+    }
+    const cached = multimodalBlobCache.get(src)
+    if (cached) {
+      setBlobUrl(cached)
+      return
+    }
+    let active = true
+    setBlobUrl(null)
+    setFailed(false)
+    fetchMultimodalBlob(src as string)
+      .then((u) => {
+        if (!active) return
+        multimodalBlobCache.set(src as string, u)
+        setBlobUrl(u)
+      })
+      .catch((err) => {
+        console.error('[MultimodalImg] blob failed', src, err)
+        if (active) setFailed(true)
+      })
+    return () => {
+      active = false
+    }
+  }, [src, isMultimodal])
+
+  if (!isMultimodal) {
+    if (!src) return null
+    return <img src={src} alt={alt} title={title} className="my-2 max-w-sm rounded-md" />
+  }
+  if (blobUrl) {
+    return <img src={blobUrl} alt={alt} title={title} className="my-2 max-w-sm rounded-md" />
+  }
+  if (failed) {
+    return (
+      <div className="my-2 text-xs text-red-500">
+        [Image load failed: {alt || src}]
+      </div>
+    )
+  }
+  return <span className="text-xs text-muted-foreground">[Loading image…]</span>
+})
 
 // KaTeX configuration options interface
 interface KaTeXOptions {
@@ -68,7 +138,7 @@ export const ChatMessage = ({
   const [isThinkingExpanded, setIsThinkingExpanded] = useState<boolean>(false)
 
   // Directly use props passed from the parent.
-  const { thinkingContent, displayContent, thinkingTime, responseTime, firstTokenTime, isThinking } = message
+  const { thinkingContent, displayContent, thinkingTime, responseTime, firstTokenTime, inputTokens, outputTokens, isThinking } = message
 
   // Reset expansion state when new thinking starts.
   // Render-time comparison avoids cascading renders from setState-in-useEffect.
@@ -154,7 +224,12 @@ export const ChatMessage = ({
     h4: ({ children }: { children?: ReactNode }) => <h4 className="text-base font-semibold mt-3 mb-2">{children}</h4>,
     ul: ({ children }: { children?: ReactNode }) => <ul className="list-disc pl-5 my-2">{children}</ul>,
     ol: ({ children }: { children?: ReactNode }) => <ol className="list-decimal pl-5 my-2">{children}</ol>,
-    li: ({ children }: { children?: ReactNode }) => <li className="my-1">{children}</li>
+    li: ({ children }: { children?: ReactNode }) => <li className="my-1">{children}</li>,
+    // Inline multimodal images: URLs inlined into the LLM answer point at
+    // /multimodal/{doc_stem}/{media_id}. The browser cannot attach the API key to
+    // a plain <img> request, so resolve them to blob: URLs via the authenticated
+    // axios client before rendering.
+    img: (props: any) => <MultimodalImg src={props.src} alt={props.alt} title={props.title} />,
   }), [message.mermaidRendered, message.role]);
 
   const thinkingMarkdownComponents = useMemo(() => ({
@@ -181,6 +256,12 @@ export const ChatMessage = ({
           <span className="flex items-center gap-1 tabular-nums">
             <ZapIcon className="size-3" />
             {t('retrievePanel.chatMessage.firstTokenTime', { time: firstTokenTime.toFixed(1) })}
+          </span>
+        )}
+        {typeof inputTokens === 'number' && typeof outputTokens === 'number' && (
+          <span className="flex items-center gap-1 tabular-nums">
+            <HashIcon className="size-3" />
+            {t('retrievePanel.chatMessage.tokenUsage', { input: inputTokens.toLocaleString(), output: outputTokens.toLocaleString() })}
           </span>
         )}
         {!hasContent && activeProgress && (
@@ -298,6 +379,14 @@ export const ChatMessage = ({
           role={message.role}
         />
       )}
+      {/* Retrieved sources panel — assistant messages only. Shows the file
+          origin of each cited chunk and renders any inline multimodal image
+          (the /multimodal/ src is resolved to an authenticated blob: URL by the
+          MultimodalImg component above). Expanded by default so source figures
+          are visible immediately. */}
+      {message.role === 'assistant' && message.references && message.references.length > 0 && (
+        <ReferencePanel references={message.references} />
+      )}
       {/* Once answer text has started, the timing row follows at the end of
           the answer (progress is already hidden by then). */}
       {hasContent && timingRow}
@@ -322,6 +411,77 @@ export const ChatMessage = ({
   )
 }
 
+// Retrieved-sources panel. Collapsible; each reference lists its source file
+// and the chunk text (which may contain inline /multimodal/ image links). The
+// custom `img` component resolves those to authenticated blob: URLs so they
+// render without widening the chat answer schema's allow-list.
+const ReferencePanel = memo(function ReferencePanel({
+  references,
+}: {
+  references: Reference[]
+}) {
+  const { t } = useTranslation()
+  const [open, setOpen] = useState(false)
+
+  if (!references || references.length === 0) return null
+
+  return (
+    <div className="mt-3 overflow-hidden rounded-md border border-border bg-background/60">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="flex w-full items-center gap-1.5 px-3 py-2 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <ChevronDownIcon className={`size-4 shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} />
+        {t('retrievePanel.chatMessage.references', {
+          count: references.length,
+          defaultValue: `Sources (${references.length})`,
+        })}
+      </button>
+      {open && (
+        <div className="space-y-3 border-t border-border px-3 py-3">
+          {references.map((ref, i) => (
+            <div key={ref.reference_id || i} className="text-sm">
+              <div className="mb-1.5 flex items-center gap-1.5 text-xs text-muted-foreground">
+                <FileIcon className="size-3.5 shrink-0" />
+                <span className="truncate" title={ref.file_path}>
+                  {ref.file_path}
+                </span>
+              </div>
+              {ref.content?.map((chunk, ci) => (
+                <div
+                  key={ci}
+                  className="prose dark:prose-invert max-w-none text-sm break-words prose-img:my-2 prose-img:max-w-sm prose-img:rounded-md"
+                >
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    rehypePlugins={[rehypeRaw, [rehypeSanitize, referenceSanitizeSchema]]}
+                    skipHtml={false}
+                    components={{ img: (props: any) => <MultimodalImg src={props.src} alt={props.alt} title={props.title} /> }}
+                  >
+                    {chunk}
+                  </ReactMarkdown>
+                </div>
+              ))}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+})
+
+// Preprocess markdown content so that image URLs with spaces (e.g. from
+// document filenames like "My Doc.docx") are percent-encoded. CommonMark
+// requires spaces in image URLs to be encoded; without this the markdown parser
+// leaves `![alt](url with space)` as plain text instead of creating an <img>.
+function encodeImageUrlSpaces(content: string): string {
+  return content.replace(/!\[([^\]]*)\]\(([^)]+)\)/g, (_match, alt, url) => {
+    if (!url.includes(' ')) return _match
+    return `![${alt}](${url.replace(/ /g, '%20')})`
+  })
+}
+
 // Main answer markdown, isolated behind memo so the 100ms stopwatch re-render
 // of a message (which only touches the timing row) does NOT re-run the markdown
 // / syntax-highlight / KaTeX pipeline over the whole answer. All props are
@@ -342,6 +502,7 @@ const MessageMarkdown = memo(function MessageMarkdown({
   latexRendered: boolean
   role: Message['role']
 }) {
+  const safeContent = encodeImageUrlSpaces(content)
   return (
     <div className="relative">
       <div className={`prose dark:prose-invert max-w-none text-sm break-words prose-headings:mt-4 prose-headings:mb-2 prose-p:my-2 prose-ul:my-2 prose-ol:my-2 prose-li:my-1 [&_.katex]:text-current [&_.katex-display]:my-4 [&_.katex-display]:max-w-full [&_.katex-display_>.base]:overflow-x-auto [&_sup]:text-[0.75em] [&_sup]:align-[0.1em] [&_sup]:leading-[0] [&_sub]:text-[0.75em] [&_sub]:align-[-0.2em] [&_sub]:leading-[0] [&_mark]:bg-yellow-200 [&_mark]:dark:bg-yellow-800 [&_u]:underline [&_del]:line-through [&_ins]:underline [&_ins]:decoration-green-500 [&_.footnotes]:mt-8 [&_.footnotes]:pt-4 [&_.footnotes]:border-t [&_.footnotes_ol]:text-sm [&_.footnotes_li]:my-1 ${
@@ -381,7 +542,7 @@ const MessageMarkdown = memo(function MessageMarkdown({
           skipHtml={false}
           components={components}
         >
-          {content}
+          {safeContent}
         </ReactMarkdown>
       </div>
     </div>

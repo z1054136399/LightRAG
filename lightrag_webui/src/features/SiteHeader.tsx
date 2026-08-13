@@ -1,13 +1,15 @@
+import { useCallback } from 'react'
 import Button from '@/components/ui/Button'
 import { SiteInfo, webuiPrefix } from '@/lib/constants'
 import AppSettings from '@/components/AppSettings'
 import { TabsList, TabsTrigger } from '@/components/ui/Tabs'
 import { useSettingsStore } from '@/stores/settings'
 import { useAuthStore } from '@/stores/state'
+import { useKBStore } from '@/stores/kb'
 import { cn } from '@/lib/utils'
 import { useTranslation } from 'react-i18next'
 import { navigationService } from '@/services/navigation'
-import { ZapIcon, LogOutIcon } from 'lucide-react'
+import { ZapIcon, LogOutIcon, ChevronLeftIcon } from 'lucide-react'
 import GithubIcon from '@/components/icons/GithubIcon'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/Tooltip'
 
@@ -33,6 +35,7 @@ function NavigationTab({ value, currentTab, children }: NavigationTabProps) {
 
 function TabsNavigation() {
   const currentTab = useSettingsStore.use.currentTab()
+  const activeKbId = useKBStore((s) => s.activeKbId)
   const { t } = useTranslation()
 
   return (
@@ -41,12 +44,24 @@ function TabsNavigation() {
         <NavigationTab value="documents" currentTab={currentTab}>
           {t('header.documents')}
         </NavigationTab>
-        <NavigationTab value="knowledge-graph" currentTab={currentTab}>
-          {t('header.knowledgeGraph')}
-        </NavigationTab>
-        <NavigationTab value="retrieval" currentTab={currentTab}>
-          {t('header.retrieval')}
-        </NavigationTab>
+        {/* Global search is only shown when NOT inside a specific KB — inside a KB
+            the "retrieval" tab already limits search to that KB, so showing both
+            "search" and "retrieval" with the same Chinese label causes confusion. */}
+        {!activeKbId && (
+          <NavigationTab value="search" currentTab={currentTab}>
+            {t('header.search')}
+          </NavigationTab>
+        )}
+        {activeKbId && (
+          <>
+            <NavigationTab value="knowledge-graph" currentTab={currentTab}>
+              {t('header.knowledgeGraph')}
+            </NavigationTab>
+            <NavigationTab value="retrieval" currentTab={currentTab}>
+              {t('header.retrieval')}
+            </NavigationTab>
+          </>
+        )}
         <NavigationTab value="api" currentTab={currentTab}>
           {t('header.api')}
         </NavigationTab>
@@ -58,6 +73,9 @@ function TabsNavigation() {
 export default function SiteHeader() {
   const { t } = useTranslation()
   const { isGuestMode, coreVersion, apiVersion, username, webuiTitle, webuiDescription } = useAuthStore()
+  const activeKbId = useKBStore((s) => s.activeKbId)
+  const activeKbName = useKBStore((s) => s.activeKbName)
+  const setActiveKbId = useKBStore((s) => s.setActiveKbId)
 
   const versionDisplay = (coreVersion && apiVersion)
     ? `${coreVersion}/${apiVersion}`
@@ -72,6 +90,11 @@ export default function SiteHeader() {
   const handleLogout = () => {
     navigationService.navigateToLogin();
   }
+
+  const handleBackToKBList = useCallback(() => {
+    setActiveKbId(null)
+    useSettingsStore.getState().setCurrentTab('documents')
+  }, [setActiveKbId])
 
   return (
     <header className="border-border/40 bg-background/95 supports-[backdrop-filter]:bg-background/60 sticky top-0 z-50 flex h-10 w-full border-b px-4 backdrop-blur">
@@ -97,6 +120,18 @@ export default function SiteHeader() {
                 )}
               </Tooltip>
             </TooltipProvider>
+          </div>
+        )}
+        {activeKbId && activeKbName && (
+          <div className="flex items-center">
+            <span className="mx-1 text-xs text-gray-500 dark:text-gray-400">/</span>
+            <button
+              onClick={handleBackToKBList}
+              className="flex items-center gap-0.5 text-sm font-medium hover:text-emerald-500 transition-colors cursor-pointer"
+            >
+              <ChevronLeftIcon className="size-3.5" />
+              {activeKbName}
+            </button>
           </div>
         )}
       </div>

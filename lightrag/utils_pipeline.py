@@ -131,6 +131,92 @@ def apply_trusted_sentence_split_regex(
     return sanitized
 
 
+def _shrink_source_span(chunk: dict[str, Any], new_content: str) -> None:
+    """Shrink ``_source_span["end"]`` to match a shorter ``new_content``.
+
+    Called after stripping a trailing fragment from a chunk: the span start is
+    unchanged, but the end must move left to stay consistent with the new content
+    so that ``backfill_chunk_sidecars`` can still validate the chunk.
+    """
+    span = chunk.get("_source_span")
+    if not isinstance(span, dict):
+        return
+    start = span.get("start")
+    if not isinstance(start, int):
+        return
+    chunk["_source_span"] = {**span, "end": start + len(new_content)}
+
+
+def repair_split_drawing_tags(chunking_result: list[dict[str, Any]]) -> None:
+    """Fix ``<drawing>`` tags split across consecutive chunk boundaries (in-place).
+
+    Token-based chunkers split text at token positions without awareness of
+    inline XML markers.  When a chunk size limit is hit mid-tag, chunk[i] ends
+    with an incomplete ``<drawing …`` fragment and chunk[i+1] starts with the
+    attribute continuation ``…/>``.  Neither half is a valid tag, so
+    ``inject_image_urls`` cannot convert either one.
+
+    Strategy: scan pairs of consecutive chunks.  If chunk[i] ends with a
+    ``<drawing`` that has no closing ``/>`` in the same chunk, locate the ``/>``
+    in chunk[i+1], reconstruct the full tag, strip the fragment from chunk[i]'s
+    content, and prepend the complete tag to chunk[i+1]'s content.
+    """
+    for i in range(len(chunking_result) - 1):
+        content = chunking_result[i].get("content", "")
+        last_open = content.rfind("<drawing")
+        if last_open == -1:
+            continue
+        fragment = content[last_open:]
+        if "/>" in fragment:
+            continue  # tag is complete in this chunk
+
+        # Incomplete tag: find the continuation in the next chunk.
+        next_content = chunking_result[i + 1].get("content", "")
+
+        # With chunk overlap the complete tag is often already present at the
+        # start of chunk[i+1] (the overlap re-copies the end of chunk[i]).
+        # Detect this by checking whether a complete self-closing tag with the
+        # same drawing id already exists in next_content.  If it does, just
+        # drop the fragment from chunk[i] — chunk[i+1] is already correct.
+        id_match = re.search(r'\bid="([^"]+)"', fragment)
+        if id_match:
+            drawing_id = id_match.group(1)
+            if re.search(
+                r'<drawing\b[^>]*?\bid="' + re.escape(drawing_id) + r'"[^>]*?/>',
+                next_content,
+            ):
+                new_content = content[:last_open].rstrip()
+                chunking_result[i]["content"] = new_content
+                _shrink_source_span(chunking_result[i], new_content)
+                continue
+
+        close_pos = next_content.find("/>")
+        if close_pos == -1:
+            # Tag spans more than two chunks (extremely unlikely) — just drop
+            # the fragment so it does not render as garbage text.
+            new_content = content[:last_open].rstrip()
+            chunking_result[i]["content"] = new_content
+            _shrink_source_span(chunking_result[i], new_content)
+            continue
+
+        continuation = next_content[: close_pos + 2]  # up to and including "/>"
+        full_tag = fragment + continuation
+
+        # Strip the fragment from chunk[i].
+        new_content = content[:last_open].rstrip()
+        chunking_result[i]["content"] = new_content
+        _shrink_source_span(chunking_result[i], new_content)
+
+        # Replace the dangling continuation with the full tag at the start of
+        # chunk[i+1], preserving whatever follows the closing "/>" in that chunk.
+        tail = next_content[close_pos + 2 :].lstrip("\n")
+        chunking_result[i + 1]["content"] = full_tag + ("\n" + tail if tail else "")
+        # chunk[i+1]'s span covered only next_content; full_tag straddles both
+        # original chunks so the old span is no longer valid.
+        chunking_result[i + 1].pop("_source_span", None)
+        chunking_result[i + 1]["_drawing_tag_repaired"] = True
+
+
 def build_chunks_dict_from_chunking_result(
     chunking_result: list[dict[str, Any]],
     *,

@@ -1,0 +1,68 @@
+[
+  {
+    "page_idx": 0,
+    "bbox": [
+      163,
+      167,
+      423,
+      197
+    ],
+    "type": "text",
+    "text": "Test Document Title"
+  },
+  {
+    "page_idx": 0,
+    "bbox": [
+      163,
+      388,
+      496,
+      423
+    ],
+    "type": "text",
+    "text": "Hello World, this is page 1."
+  },
+  {
+    "page_idx": 0,
+    "bbox": [
+      163,
+      555,
+      553,
+      589
+    ],
+    "type": "text",
+    "text": "Some paragraph content here."
+  },
+  {
+    "page_idx": 0,
+    "bbox": [
+      163,
+      832,
+      273,
+      862
+    ],
+    "type": "equation",
+    "text": "$1 + 1 = 2$"
+  },
+  {
+    "page_idx": 0,
+    "bbox": [
+      163,
+      1110,
+      313,
+      1144
+    ],
+    "type": "text",
+    "text": "Name Age"
+  },
+  {
+    "page_idx": 0,
+    "bbox": [
+      163,
+      1193,
+      278,
+      1223
+    ],
+    "type": "text",
+    "text": "Alice 30"
+  }
+]

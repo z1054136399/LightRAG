@@ -6,7 +6,7 @@ import { Message, QueryRequest } from '@/api/lightrag'
 
 type Theme = 'dark' | 'light' | 'system'
 type Language = 'en' | 'zh' | 'fr' | 'ar' | 'zh_TW' | 'ru' | 'ja' | 'de' | 'uk' | 'ko' | 'vi'
-type Tab = 'documents' | 'knowledge-graph' | 'retrieval' | 'api'
+type Tab = 'documents' | 'knowledge-graph' | 'retrieval' | 'search' | 'api'
 
 interface SettingsState {
   // Document manager settings
@@ -55,6 +55,12 @@ interface SettingsState {
 
   retrievalHistory: Message[]
   setRetrievalHistory: (history: Message[]) => void
+
+  globalSearchMessages: Message[]
+  setGlobalSearchMessages: (msgs: Message[]) => void
+
+  globalSearchMessageSources: Record<string, string[]>
+  setGlobalSearchMessageSources: (sources: Record<string, string[]>) => void
 
   querySettings: Omit<QueryRequest, 'query'>
   updateQuerySettings: (settings: Partial<QueryRequest>) => void
@@ -115,6 +121,8 @@ const useSettingsStoreBase = create<SettingsState>()(
       documentsPageSize: 10,
 
       retrievalHistory: [],
+      globalSearchMessages: [],
+      globalSearchMessageSources: {},
       userPromptHistory: [...suggestedUserPrompts],
 
       querySettings: {
@@ -179,6 +187,9 @@ const useSettingsStoreBase = create<SettingsState>()(
 
       setRetrievalHistory: (history: Message[]) => set({ retrievalHistory: history }),
 
+      setGlobalSearchMessages: (msgs: Message[]) => set({ globalSearchMessages: msgs }),
+      setGlobalSearchMessageSources: (sources: Record<string, string[]>) => set({ globalSearchMessageSources: sources }),
+
       updateQuerySettings: (settings: Partial<QueryRequest>) => {
         // Filter out history_turns to prevent changes, always keep it as 0
         const filteredSettings = { ...settings }
@@ -229,7 +240,7 @@ const useSettingsStoreBase = create<SettingsState>()(
     {
       name: 'settings-storage',
       storage: createJSONStorage(() => localStorage),
-      version: 20,
+      version: 21,
       migrate: (state: any, version: number) => {
         if (version < 2) {
           state.showEdgeLabel = false
@@ -341,6 +352,10 @@ const useSettingsStoreBase = create<SettingsState>()(
             ...existing,
             ...suggestedUserPrompts.filter((p: string) => !existing.includes(p))
           ]
+        }
+        if (version < 21) {
+          state.globalSearchMessages = []
+          state.globalSearchMessageSources = {}
         }
         return state
       }

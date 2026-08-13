@@ -1,0 +1,35 @@
+[
+  {
+    "page_idx": 0,
+    "bbox": [
+      195,
+      165,
+      942,
+      211
+    ],
+    "type": "text",
+    "text": "LightRAG dots2mineru integration e2e test."
+  },
+  {
+    "page_idx": 0,
+    "bbox": [
+      195,
+      259,
+      942,
+      298
+    ],
+    "type": "text",
+    "text": "Unique keyword ZebraPlasma2026 for verification."
+  },
+  {
+    "page_idx": 0,
+    "bbox": [
+      195,
+      360,
+      479,
+      395
+    ],
+    "type": "equation",
+    "text": "$$\n\\text{Formula: } E = m c^2\n$$"
+  }
+]

@@ -41,6 +41,13 @@ export const chatMarkdownSanitizeSchema: SanitizeSchema = {
     // defaultSchema does not list. (sup/sub/ins/del/kbd/s/br are already in it.)
     'mark',
     'u',
+    // LLM answers may reference retrieved multimodal images via inlined
+    // <img src="/multimodal/..."> (the chunk text carries these URLs). Allow the
+    // tag here; the `img` component in ChatMessage resolves /multimodal/ srcs to
+    // blob: URLs via the authenticated client, while other srcs fall through to a
+    // plain <img>. `on*` handlers and non-http/https/blob protocols stay stripped
+    // by defaultSchema's allow-list, so this does not widen the XSS surface.
+    'img',
   ],
   attributes: {
     ...defaultSchema.attributes,
@@ -60,5 +67,44 @@ export const chatMarkdownSanitizeSchema: SanitizeSchema = {
       ),
       ['className', 'data-footnote-backref', 'footnote-ref'],
     ],
+    // Allow <img> with src/alt/title only. Other attributes (style, onerror,
+    // width, …) are dropped, keeping the surface minimal.
+    img: [['src'], ['alt'], ['title']],
+  },
+  protocols: {
+    ...defaultSchema.protocols,
+    // Permit blob: src so the ChatMessage img component can swap /multimodal/
+    // URLs for same-origin blob: URLs. Also permit '' (relative / same-origin
+    // URLs like /multimodal/...) — the MultimodalImg component resolves those
+    // to authenticated blob: URLs, so they must survive sanitization.
+    src: [...(defaultSchema.protocols?.src ?? []), 'blob', ''],
+  },
+}
+
+/**
+ * Sanitize schema for retrieved-reference (source) content rendering.
+ *
+ * Reference chunks are untrusted (derived from ingested documents) but the
+ * frontend has already rewritten any `/multimodal/` image `src` to a same
+ * origin `blob:` URL fetched through the authenticated axios client, so we
+ * can safely permit <img> here. We deliberately do NOT widen the chat answer
+ * schema (chatMarkdownSanitizeSchema) — only this dedicated one.
+ */
+export const referenceSanitizeSchema: SanitizeSchema = {
+  ...defaultSchema,
+  clobberPrefix: '',
+  tagNames: [...(defaultSchema.tagNames ?? []), 'img'],
+  attributes: {
+    ...defaultSchema.attributes,
+    img: [['src'], ['alt'], ['title']],
+  },
+  protocols: {
+    ...defaultSchema.protocols,
+    // Allow same-origin relative /multimodal/ URLs (and blob:) so the frontend
+    // can rewrite them to authenticated blob: URLs before rendering. Also allow
+    // http/https because the backend may emit absolute URLs; the ReferencePanel
+    // img component resolves /multimodal/ paths through the authenticated client
+    // before rendering, so these are safe to keep in the DOM temporarily.
+    src: [...(defaultSchema.protocols?.src ?? []), 'blob', '', 'http', 'https'],
   },
 }

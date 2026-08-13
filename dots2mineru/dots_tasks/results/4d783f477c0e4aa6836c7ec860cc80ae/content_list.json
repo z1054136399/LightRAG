@@ -1,0 +1,35 @@
+[
+  {
+    "page_idx": 0,
+    "bbox": [
+      107,
+      194,
+      435,
+      232
+    ],
+    "type": "text",
+    "text": "Figure 1: Sales by Region"
+  },
+  {
+    "page_idx": 0,
+    "bbox": [
+      55,
+      110,
+      1627,
+      1008
+    ],
+    "type": "image",
+    "img_path": "images/image_0.png"
+  },
+  {
+    "page_idx": 0,
+    "bbox": [
+      80,
+      1008,
+      693,
+      1043
+    ],
+    "type": "text",
+    "text": "This report shows regional sales distribution."
+  }
+]

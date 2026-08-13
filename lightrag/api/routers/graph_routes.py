@@ -2,11 +2,12 @@
 This module contains all graph-related routes for the LightRAG API.
 """
 
-from typing import Optional, Dict, Any
+from typing import Annotated, Optional, Dict, Any
 import traceback
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Path as _ApiPath, Query, HTTPException
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from lightrag import LightRAG
 from lightrag.base import DeletionResult
 from lightrag.utils import logger
 from ..utils_api import get_combined_auth_dependency, internal_server_error
@@ -153,7 +154,7 @@ class RelationCreateRequest(BaseModel):
         return _require_nonempty_entity_name(entity_name)
 
 
-def create_graph_routes(rag, api_key: Optional[str] = None):
+def create_graph_routes(rag: LightRAG | None = None, api_key: Optional[str] = None, *, kb_registry=None):
     # Fresh router per call. A module-level instance would accumulate
     # duplicate routes when the factory is invoked more than once in the
     # same process (e.g. across tests), which triggers FastAPI's
@@ -162,8 +163,28 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
 
     combined_auth = get_combined_auth_dependency(api_key)
 
+    if kb_registry is not None:
+        from lightrag.api.kb_registry import KBNotFoundError
+
+        async def _get_rag(kb_id: str = _ApiPath(...)) -> LightRAG:
+            try:
+                return await kb_registry.get_rag(kb_id)
+            except KBNotFoundError:
+                raise HTTPException(status_code=404, detail=f"KB not found: {kb_id}")
+
+        _rag_default = None
+    else:
+        _captured_rag = rag
+
+        async def _get_rag() -> LightRAG:  # type: ignore[misc]
+            return _captured_rag
+
+        _rag_default = _captured_rag
+
+    RagDep = Annotated[LightRAG, Depends(_get_rag)]
+
     @router.get("/graph/label/list", dependencies=[Depends(combined_auth)])
-    async def get_graph_labels():
+    async def get_graph_labels(rag: RagDep = _rag_default):
         """
         Get all graph labels
 
@@ -182,6 +203,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         limit: int = Query(
             300, description="Maximum number of popular labels to return", ge=1, le=1000
         ),
+        rag: RagDep = _rag_default,
     ):
         """
         Get popular labels by node degree (most connected entities)
@@ -205,6 +227,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         limit: int = Query(
             50, description="Maximum number of search results to return", ge=1, le=100
         ),
+        rag: RagDep = _rag_default,
     ):
         """
         Search labels with fuzzy matching
@@ -228,6 +251,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         label: str = Query(..., description="Label to get knowledge graph for"),
         max_depth: int = Query(3, description="Maximum depth of graph", ge=1),
         max_nodes: int = Query(1000, description="Maximum nodes to return", ge=1),
+        rag: RagDep = _rag_default,
     ):
         """
         Retrieve a connected subgraph of nodes where the label includes the specified label.
@@ -262,6 +286,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
     @router.get("/graph/entity/exists", dependencies=[Depends(combined_auth)])
     async def check_entity_exists(
         name: str = Query(..., description="Entity name to check"),
+        rag: RagDep = _rag_default,
     ):
         """
         Check if an entity with the given name exists in the knowledge graph
@@ -281,7 +306,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             raise internal_server_error(e)
 
     @router.post("/graph/entity/edit", dependencies=[Depends(combined_auth)])
-    async def update_entity(request: EntityUpdateRequest):
+    async def update_entity(request: EntityUpdateRequest, rag: RagDep = _rag_default):
         """
         Update an entity's properties in the knowledge graph
 
@@ -475,7 +500,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             raise internal_server_error(e)
 
     @router.post("/graph/relation/edit", dependencies=[Depends(combined_auth)])
-    async def update_relation(request: RelationUpdateRequest):
+    async def update_relation(request: RelationUpdateRequest, rag: RagDep = _rag_default):
         """Update a relation's properties in the knowledge graph
 
         Args:
@@ -515,7 +540,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             raise internal_server_error(e)
 
     @router.post("/graph/entity/create", dependencies=[Depends(combined_auth)])
-    async def create_entity(request: EntityCreateRequest):
+    async def create_entity(request: EntityCreateRequest, rag: RagDep = _rag_default):
         """
         Create a new entity in the knowledge graph
 
@@ -590,7 +615,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             raise internal_server_error(e)
 
     @router.post("/graph/relation/create", dependencies=[Depends(combined_auth)])
-    async def create_relation(request: RelationCreateRequest):
+    async def create_relation(request: RelationCreateRequest, rag: RagDep = _rag_default):
         """
         Create a new relationship between two entities in the knowledge graph
 
@@ -680,7 +705,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
             raise internal_server_error(e)
 
     @router.post("/graph/entities/merge", dependencies=[Depends(combined_auth)])
-    async def merge_entities(request: EntityMergeRequest):
+    async def merge_entities(request: EntityMergeRequest, rag: RagDep = _rag_default):
         """
         Merge multiple entities into a single entity, preserving all relationships
 
@@ -770,7 +795,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         response_model=DeletionResult,
         dependencies=[Depends(combined_auth)],
     )
-    async def delete_entity(request: DeleteEntityRequest):
+    async def delete_entity(request: DeleteEntityRequest, rag: RagDep = _rag_default):
         """
         Delete an entity and all its relationships from the knowledge graph.
 
@@ -806,7 +831,7 @@ def create_graph_routes(rag, api_key: Optional[str] = None):
         response_model=DeletionResult,
         dependencies=[Depends(combined_auth)],
     )
-    async def delete_relation(request: DeleteRelationRequest):
+    async def delete_relation(request: DeleteRelationRequest, rag: RagDep = _rag_default):
         """
         Delete a relationship between two entities from the knowledge graph.
 

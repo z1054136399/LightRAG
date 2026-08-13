@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Callable
 
 from lightrag.constants import (
     PARSER_ENGINE_DOCLING,
+    PARSER_ENGINE_DOTS,
     PARSER_ENGINE_LEGACY,
     PARSER_ENGINE_MINERU,
     PARSER_ENGINE_NATIVE,
@@ -241,6 +242,24 @@ _MINERU_SUFFIXES = frozenset(
 )
 
 
+# Formats handled by the dots.ocr engine: PDF natively, PPTX/DOCX via
+# LibreOffice → PDF conversion, and standalone images directly.
+_DOTS_SUFFIXES = frozenset(
+    {
+        "pdf",
+        "docx",
+        "pptx",
+        "png",
+        "jpg",
+        "jpeg",
+        "bmp",
+        "tif",
+        "tiff",
+        "webp",
+        "gif",
+    }
+)
+
 # Formats available in the baseline Docling deployment. Optional converters
 # depend on packages installed by the endpoint and are opted into per
 # deployment via DOCLING_ADDITIONAL_SUFFIXES (see ``extra_suffixes_env``).
@@ -298,6 +317,19 @@ _REGISTRY: dict[str, ParserSpec] = {
         endpoint_configured=_env_endpoint_configured("DOCLING_ENDPOINT"),
         endpoint_requirement=lambda: "DOCLING_ENDPOINT",
         extra_suffixes_env="DOCLING_ADDITIONAL_SUFFIXES",
+    ),
+    PARSER_ENGINE_DOTS: ParserSpec(
+        engine_name=PARSER_ENGINE_DOTS,
+        impl="lightrag.parser.external.dots.parser:DotsParser",
+        suffixes=_DOTS_SUFFIXES,
+        queue_group=PARSER_ENGINE_DOTS,
+        concurrency=int(os.getenv("DOTS_MAX_WORKERS", "4")),
+        endpoint_configured=lambda: bool(
+            os.getenv("DOTS_API_URL", "").strip()
+            and os.getenv("DOTS_API_TOKEN", "").strip()
+        ),
+        endpoint_requirement=lambda: "DOTS_API_URL and DOTS_API_TOKEN",
+        extra_suffixes_env="DOTS_ADDITIONAL_SUFFIXES",
     ),
     PARSER_ENGINE_REUSE: ParserSpec(
         engine_name=PARSER_ENGINE_REUSE,

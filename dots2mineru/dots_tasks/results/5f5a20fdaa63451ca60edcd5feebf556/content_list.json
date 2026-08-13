@@ -1,0 +1,81 @@
+[
+  {
+    "page_idx": 0,
+    "bbox": [
+      89,
+      123,
+      403,
+      161
+    ],
+    "type": "text",
+    "text": "Quarterly Sales Report"
+  },
+  {
+    "page_idx": 0,
+    "bbox": [
+      89,
+      190,
+      970,
+      227
+    ],
+    "type": "text",
+    "text": "This document summarizes Q1 2025 regional sales performance."
+  },
+  {
+    "page_idx": 0,
+    "bbox": [
+      89,
+      304,
+      701,
+      372
+    ],
+    "type": "text",
+    "text": "# Regional Breakdown",
+    "text_level": 2
+  },
+  {
+    "page_idx": 0,
+    "bbox": [
+      89,
+      446,
+      963,
+      515
+    ],
+    "type": "text",
+    "text": "North region achieved 320 units. South led with 480 units. East recorded 210 units. West delivered 390 units."
+  },
+  {
+    "page_idx": 0,
+    "bbox": [
+      89,
+      581,
+      627,
+      617
+    ],
+    "type": "text",
+    "text": "Figure 1: Q1 Sales by Region bar chart."
+  },
+  {
+    "page_idx": 0,
+    "bbox": [
+      89,
+      695,
+      417,
+      753
+    ],
+    "type": "text",
+    "text": "# Conclusion",
+    "text_level": 2
+  },
+  {
+    "page_idx": 0,
+    "bbox": [
+      89,
+      836,
+      993,
+      872
+    ],
+    "type": "text",
+    "text": "South region is the top performer this quarter with 480 units sold."
+  }
+]

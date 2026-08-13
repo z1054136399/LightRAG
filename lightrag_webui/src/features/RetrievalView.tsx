@@ -2,7 +2,7 @@ import Textarea from '@/components/ui/Textarea'
 import Input from '@/components/ui/Input'
 import Button from '@/components/ui/Button'
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { queryText, queryTextStream } from '@/api/lightrag'
+import { queryText, queryTextStream, multiKBQuery } from '@/api/lightrag'
 import { errorMessage } from '@/lib/utils'
 import { useSettingsStore } from '@/stores/settings'
 import { useDebounce } from '@/hooks/useDebounce'
@@ -13,6 +13,8 @@ import { useTranslation } from 'react-i18next'
 import { toast } from 'sonner'
 import { copyToClipboard } from '@/utils/clipboard'
 import type { QueryMode } from '@/api/lightrag'
+import { listKBs, type KBMeta } from '@/api/kb'
+import { useKBStore } from '@/stores/kb'
 
 // Distance from the bottom (px) within which a user's downward scroll re-enables
 // auto-follow. Wide enough to absorb streaming content growth between the user's
@@ -147,6 +149,32 @@ export default function RetrievalView() {
   })
   const [inputValue, setInputValue] = useState('')
   const [isLoading, setIsLoading] = useState(false)
+
+  // Multi-KB selector state — only shown when multiple KBs exist
+  const activeKbId = useKBStore((s) => s.activeKbId)
+  const [availableKBs, setAvailableKBs] = useState<KBMeta[]>([])
+  const [selectedKbIds, setSelectedKbIds] = useState<string[]>([])
+
+  // Fetch KB list so we can show the multi-KB selector
+  useEffect(() => {
+    listKBs()
+      .then((kbs) => {
+        setAvailableKBs(kbs)
+        // Default: select the active KB if set, otherwise no pre-selection
+        if (activeKbId && kbs.some((k) => k.id === activeKbId)) {
+          setSelectedKbIds((prev) => prev.length > 0 ? prev : [activeKbId])
+        }
+      })
+      .catch(() => {
+        // Non-fatal: just don't show the selector
+      })
+  }, [activeKbId])
+
+  const toggleKbSelection = useCallback((kbId: string) => {
+    setSelectedKbIds((prev) =>
+      prev.includes(kbId) ? prev.filter((id) => id !== kbId) : [...prev, kbId]
+    )
+  }, [])
   // Current retrieval pipeline step (e.g. "extracting_keywords") — shown to
   // the user while the query is in flight so they see live progress.
   const [queryProgress, setQueryProgress] = useState<string | null>(null)
@@ -163,6 +191,8 @@ export default function RetrievalView() {
   // Authoritative server-side duration returned by the backend. When present,
   // this overrides the client-side stopwatch estimate for the final display.
   const serverResponseTimeRef = useRef<number | null>(null)
+  // Authoritative token counts returned by the backend metadata line.
+  const serverTokenUsageRef = useRef<{ inputTokens: number; outputTokens: number } | null>(null)
   // Tracks whether the time-to-first-token has already been recorded for the
   // current query so we only stamp it on the very first chunk.
   const firstTokenRecordedRef = useRef(false)
@@ -321,10 +351,13 @@ export default function RetrievalView() {
       // stopwatch. Cleared in the finally block below.
       responseStartRef.current = Date.now()
       serverResponseTimeRef.current = null
+      serverTokenUsageRef.current = null
       firstTokenRecordedRef.current = false
       isStreamingRef.current = state.querySettings.stream ?? false
       assistantMessage.responseTime = 0
       assistantMessage.firstTokenTime = null
+      assistantMessage.inputTokens = null
+      assistantMessage.outputTokens = null
       if (responseTimerRef.current) clearInterval(responseTimerRef.current)
       responseTimerRef.current = setInterval(() => {
         const elapsed = (Date.now() - (responseStartRef.current ?? Date.now())) / 1000
@@ -458,6 +491,10 @@ export default function RetrievalView() {
         response_type: 'Multiple Paragraphs',
         // Request retrieval progress events for the live progress display.
         include_progress: true,
+        // Request retrieved sources + their chunk text so the UI can show a
+        // "召回来源" panel with inline multimodal images.
+        include_references: true,
+        include_chunk_content: true,
         conversation_history: effectiveHistoryTurns > 0
           ? prevMessages
             .filter((m) => m.isError !== true)
@@ -467,9 +504,37 @@ export default function RetrievalView() {
         ...(modeOverride ? { mode: modeOverride } : {})
       }
 
+      // Determine if this is a multi-KB query (2+ KBs selected)
+      const isMultiKBQuery = selectedKbIds.length >= 2
+
       try {
-        // Run query
-        if (state.querySettings.stream) {
+        if (isMultiKBQuery) {
+          // Multi-KB non-streaming: fan out to all selected KBs, render per-KB sections
+          const multiKBRequest = {
+            ...queryParams,
+            kbs: selectedKbIds,
+            stream: false,
+            include_progress: false,
+          }
+          const mkResult = await multiKBQuery(multiKBRequest, controller.signal)
+          // Format as a single assistant message with KB-attributed sections
+          const sections = mkResult.responses
+            .map((r) => `**[${r.kb_name}]**\n\n${r.response}`)
+            .join('\n\n---\n\n')
+          updateAssistantMessage(sections)
+          const allRefs = mkResult.all_references
+          if (allRefs && allRefs.length > 0) {
+            assistantMessage.references = allRefs
+            setMessages((prev) => {
+              const newMessages = [...prev]
+              const lastMessage = newMessages[newMessages.length - 1]
+              if (lastMessage && lastMessage.id === assistantMessage.id) {
+                lastMessage.references = allRefs
+              }
+              return newMessages
+            })
+          }
+        } else if (state.querySettings.stream) {
           let errorMessage = ''
           await queryTextStream(
             queryParams,
@@ -486,6 +551,28 @@ export default function RetrievalView() {
             },
             (event) => {
               setQueryProgress(event)
+            },
+            // Retrieved sources (first NDJSON line when include_references).
+            // Attach the raw references; the chat renderer resolves any
+            // /multimodal/ image URL to an authenticated blob: URL inline.
+            (refs) => {
+              try {
+                assistantMessage.references = refs
+                setMessages((prev) => {
+                  const newMessages = [...prev]
+                  const lastMessage = newMessages[newMessages.length - 1]
+                  if (lastMessage && lastMessage.id === assistantMessage.id) {
+                    lastMessage.references = refs
+                  }
+                  return newMessages
+                })
+              } catch (e) {
+                console.warn('Failed to attach references:', e)
+              }
+            },
+            // Token usage (emitted alongside response_time in the final metadata line).
+            (inputTokens, outputTokens) => {
+              serverTokenUsageRef.current = { inputTokens, outputTokens }
             }
           )
           if (errorMessage) {
@@ -499,7 +586,21 @@ export default function RetrievalView() {
           if (typeof response.response_time === 'number') {
             serverResponseTimeRef.current = response.response_time
           }
+          if (typeof response.input_tokens === 'number' && typeof response.output_tokens === 'number') {
+            serverTokenUsageRef.current = { inputTokens: response.input_tokens, outputTokens: response.output_tokens }
+          }
           updateAssistantMessage(response.response)
+          if (response.references && response.references.length > 0) {
+            assistantMessage.references = response.references
+            setMessages((prev) => {
+              const newMessages = [...prev]
+              const lastMessage = newMessages[newMessages.length - 1]
+              if (lastMessage && lastMessage.id === assistantMessage.id) {
+                lastMessage.references = response.references
+              }
+              return newMessages
+            })
+          }
         }
       } catch (err) {
         // If the user terminated the query, handleStop already finalized the
@@ -538,12 +639,21 @@ export default function RetrievalView() {
           responseStartRef.current = null
           serverResponseTimeRef.current = null
           firstTokenRecordedRef.current = false
-          // Sync the finalized time into the rendered message
+          // Apply token usage from backend if available
+          const tokenUsage = serverTokenUsageRef.current
+          if (tokenUsage) {
+            assistantMessage.inputTokens = tokenUsage.inputTokens
+            assistantMessage.outputTokens = tokenUsage.outputTokens
+          }
+          serverTokenUsageRef.current = null
+          // Sync the finalized time and token counts into the rendered message
           setMessages((prev) => {
             const newMessages = [...prev]
             const lastMessage = newMessages[newMessages.length - 1]
             if (lastMessage && lastMessage.id === assistantMessage.id) {
               lastMessage.responseTime = assistantMessage.responseTime
+              lastMessage.inputTokens = assistantMessage.inputTokens
+              lastMessage.outputTokens = assistantMessage.outputTokens
             }
             return newMessages
           })
@@ -587,7 +697,7 @@ export default function RetrievalView() {
         }
       }
     },
-    [inputValue, isLoading, messages, setMessages, t, scrollToBottom, setFollowScroll]
+    [inputValue, isLoading, messages, setMessages, t, scrollToBottom, setFollowScroll, selectedKbIds]
   )
 
   const handleKeyDown = useCallback((e: React.KeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
@@ -705,6 +815,7 @@ export default function RetrievalView() {
       }
       responseStartRef.current = null
       serverResponseTimeRef.current = null
+      serverTokenUsageRef.current = null
       firstTokenRecordedRef.current = false
       isStreamingRef.current = false
       activeAssistantIdRef.current = null
@@ -827,6 +938,7 @@ export default function RetrievalView() {
     }
     responseStartRef.current = null
     serverResponseTimeRef.current = null
+    serverTokenUsageRef.current = null
     firstTokenRecordedRef.current = false
     setQueryProgress(null)
     setMessages([])
@@ -895,6 +1007,7 @@ export default function RetrievalView() {
     }
     responseStartRef.current = null
     serverResponseTimeRef.current = null
+    serverTokenUsageRef.current = null
     firstTokenRecordedRef.current = false
 
     setIsLoading(false)
@@ -1045,6 +1158,27 @@ export default function RetrievalView() {
             </Button>
           )}
         </div>
+
+        {/* Multi-KB selector: only when 2+ KBs exist and not inside a specific KB */}
+        {availableKBs.length >= 2 && !activeKbId && (
+          <div className="flex shrink-0 flex-wrap items-center gap-2 rounded-md border px-3 py-2">
+            <span className="text-xs font-medium text-muted-foreground shrink-0">
+              {t('retrievePanel.multiKB.label')}
+            </span>
+            {availableKBs.map((kb) => (
+              <label key={kb.id} className="flex items-center gap-1.5 cursor-pointer text-xs">
+                <input
+                  type="checkbox"
+                  className="h-3.5 w-3.5 rounded border-input"
+                  checked={selectedKbIds.includes(kb.id)}
+                  onChange={() => toggleKbSelection(kb.id)}
+                  disabled={isLoading}
+                />
+                <span>{kb.name}</span>
+              </label>
+            ))}
+          </div>
+        )}
 
         <form
           onSubmit={handleSubmit}

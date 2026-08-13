@@ -8,6 +8,7 @@
   },
   "header": {
     "documents": "Documents",
+    "search": "Search",
     "knowledgeGraph": "Knowledge Graph",
     "retrieval": "Retrieval",
     "api": "API",
@@ -100,6 +101,12 @@
       },
       "generalError": "Upload Failed\n{{error}}",
       "fileTypes": "Supported types: {{types}}",
+      "step1Label": "Select files",
+      "step2Label": "Chunking settings",
+      "step2Hint": "{{count}} file(s) selected. Choose a chunking strategy:",
+      "nextStep": "Next",
+      "prevStep": "Back",
+      "finish": "Upload",
       "fileUploader": {
         "singleFileLimit": "Cannot upload more than 1 file at a time",
         "maxFilesLimit": "Cannot upload more than {{count}} files",
@@ -111,6 +118,62 @@
         "removeFile": "Remove file",
         "uploadDescription": "You can upload {{isMultiple ? 'multiple' : count}} files (up to {{maxSize}} each)",
         "duplicateFile": "File name already exists in server cache"
+      },
+      "chunking": {
+        "title": "Chunking Settings",
+        "strategy": "Strategy",
+        "strategyDefault": "Server default",
+        "strategyDefaultDesc": "Use the server's configured default chunking strategy. Recommended for most cases.",
+        "strategyDefaultDescLive": "{{strategy}} / chunk size {{size}} tokens / overlap {{overlap}} tokens",
+        "chunkTokenSize": "Chunk size (tokens)",
+        "chunkOverlapTokenSize": "Overlap (tokens)",
+        "splitByCharacter": "Segment delimiter",
+        "splitByCharacterPlaceholder": "Leave empty for no delimiter",
+        "separators": "Separator list",
+        "separatorsPlaceholder": "Type and press Enter to add; press Enter alone for empty string",
+        "separatorsDefault": "Leave empty for defaults (\\n\\n → \\n → space → char)",
+        "default": "Default",
+        "strategies": {
+          "fixedToken": "Fixed token",
+          "fixedTokenDesc": "Split at a fixed token count. Simple and uniform; best for evenly structured text.",
+          "recursiveCharacter": "Recursive character",
+          "recursiveCharacterDesc": "Recursively split on punctuation and newlines, preserving natural boundaries. Works well for most documents. (Recommended)",
+          "semanticVector": "Semantic vector",
+          "semanticVectorDesc": "Split based on semantic similarity scores. Best semantic coherence but slower. Overlap setting not supported.",
+          "paragraphSemantic": "Paragraph semantic",
+          "paragraphSemanticDesc": "Split by headings and paragraph structure, preserving document hierarchy. Best for structured long documents."
+        }
+      }
+    },
+    "knowledgeBases": {
+      "title": "Knowledge Bases",
+      "backToList": "Knowledge Bases",
+      "createButton": "New Knowledge Base",
+      "emptyTitle": "No knowledge bases yet",
+      "emptyDescription": "Create a knowledge base to start uploading documents.",
+      "createDialog": {
+        "title": "Create Knowledge Base",
+        "nameLabel": "Name",
+        "namePlaceholder": "e.g. Product Docs",
+        "descriptionLabel": "Description",
+        "descriptionPlaceholder": "Optional description",
+        "submit": "Create",
+        "cancel": "Cancel",
+        "duplicateNameError": "A knowledge base with this name already exists",
+        "success": "Knowledge base created"
+      },
+      "deleteDialog": {
+        "title": "Delete Knowledge Base",
+        "warning": "This will permanently delete all documents, graph data, and vectors in \"{{name}}\". This cannot be undone.",
+        "confirmPrompt": "Type the knowledge base name to confirm",
+        "confirmButton": "Delete",
+        "cancel": "Cancel",
+        "success": "Knowledge base deleted"
+      },
+      "card": {
+        "createdAt": "Created {{date}}",
+        "deleteAction": "Delete",
+        "copyId": "Click to copy KB ID"
       }
     },
     "documentManager": {
@@ -398,6 +461,16 @@
     },
     "emptyGraph": "Empty(Try Reload Again)"
   },
+  "globalSearch": {
+    "startPrompt": "Select knowledge bases and type your query",
+    "createKBHint": "Create a knowledge base first",
+    "selectKBs": "Query KBs:",
+    "placeholder": "Enter your query (Support prefix: /<Query Mode>)",
+    "noKBSelected": "Select at least one KB",
+    "allKBs": "All KBs",
+    "nKBsSelected": "{{count}} KBs selected",
+    "sources": "Sources"
+  },
   "retrievePanel": {
     "chatMessage": {
       "copyTooltip": "Copy to clipboard",
@@ -413,6 +486,7 @@
       "thinkingInProgress": "Thinking in progress...",
       "responseTime": "Response time {{time}}s",
       "firstTokenTime": "First token {{time}}s",
+      "tokenUsage": "{{input}} in / {{output}} out tokens",
       "progress": {
         "extracting_keywords": "Extracting keywords...",
         "retrieving_entities": "Retrieving entities...",
@@ -421,6 +495,9 @@
         "reranking": "Reranking results...",
         "generating_response": "Generating response..."
       }
+    },
+    "multiKB": {
+      "label": "Query KBs:"
     },
     "retrieval": {
       "startPrompt": "Start a retrieval by typing your query below",

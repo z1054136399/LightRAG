@@ -75,6 +75,12 @@ from lightrag.chunk_schema import (
     strip_internal_multimodal_markup_for_extraction,
 )
 from lightrag.prompt import PROMPTS, resolve_entity_extraction_prompt_profile
+from lightrag.multimodal_utils import (
+    doc_stem_from_filepath,
+    inject_image_urls,
+    is_multimodal_enabled,
+    multimodal_answer_hint,
+)
 from lightrag.constants import (
     GRAPH_FIELD_SEP,
     DEFAULT_MAX_ENTITY_TOKENS,
@@ -4407,6 +4413,7 @@ async def kg_query(
     system_prompt: str | None = None,
     chunks_vdb: BaseVectorStorage = None,
     progress_callback: ProgressCallback | None = None,
+    token_tracker: Any | None = None,
 ) -> QueryResult | None:
     """
     Execute knowledge graph query and return unified QueryResult object.
@@ -4506,7 +4513,7 @@ async def kg_query(
     sys_prompt_temp = system_prompt if system_prompt else PROMPTS["rag_response"]
     sys_prompt = sys_prompt_temp.format(
         response_type=response_type,
-        user_prompt=user_prompt,
+        user_prompt=f"{user_prompt}{multimodal_answer_hint(context_result.context or '')}",
         context_data=context_result.context,
     )
 
@@ -4570,6 +4577,7 @@ async def kg_query(
             history_messages=query_param.conversation_history,
             enable_cot=True,
             stream=query_param.stream,
+            token_tracker=token_tracker,
         )
 
         if (
@@ -5476,6 +5484,36 @@ async def _merge_all_chunks(
     return merged_chunks
 
 
+def _inject_multimodal_into_chunks(
+    chunks: list[dict], public_base: str
+) -> list[dict]:
+    """Return a copy of ``chunks`` with multimodal image URLs inlined into
+    ``content``, so ``render_chunks_context_text`` renders them verbatim.
+
+    A no-op (returns ``chunks`` unchanged) when multimodal is disabled.
+    Runs AFTER token-budget truncation, so the image-URL markup this adds is
+    not counted against the budget that shaped ``chunks`` — acceptable since
+    that markup is small relative to the buffer already reserved.
+    """
+    if not is_multimodal_enabled():
+        return chunks
+    injected = []
+    for chunk in chunks:
+        doc_stem = doc_stem_from_filepath(chunk.get("file_path", ""))
+        if not doc_stem:
+            injected.append(chunk)
+            continue
+        injected.append(
+            {
+                **chunk,
+                "content": inject_image_urls(
+                    chunk["content"], doc_stem, public_base=public_base
+                ),
+            }
+        )
+    return injected
+
+
 async def _build_context_str(
     entities_context: list[dict],
     relations_context: list[dict],
@@ -5580,7 +5618,10 @@ async def _build_context_str(
 
     # Rebuild chunks_context with truncated chunks
     # The actual tokens may be slightly less than available_chunk_tokens due to deduplication logic
-    text_units_str = render_chunks_context_text(truncated_chunks)
+    rendered_chunks = _inject_multimodal_into_chunks(
+        truncated_chunks, query_param.multimodal_public_base
+    )
+    text_units_str = render_chunks_context_text(rendered_chunks)
     chunks_context = [
         {"reference_id": chunk["reference_id"], "content": chunk["content"]}
         for chunk in truncated_chunks
@@ -6383,6 +6424,7 @@ async def naive_query(
     system_prompt: str | None = None,
     text_chunks_db: BaseKVStorage | None = None,
     progress_callback: ProgressCallback | None = None,
+    token_tracker: Any | None = None,
 ) -> QueryResult | None:
     """
     Execute naive query and return unified QueryResult object.
@@ -6512,7 +6554,10 @@ async def naive_query(
     }
 
     # Build chunks_context from processed chunks with reference IDs
-    text_units_str = render_chunks_context_text(processed_chunks_with_ref_ids)
+    rendered_chunks = _inject_multimodal_into_chunks(
+        processed_chunks_with_ref_ids, query_param.multimodal_public_base
+    )
+    text_units_str = render_chunks_context_text(rendered_chunks)
     reference_list_str = "\n".join(
         f"[{ref['reference_id']}] {ref['file_path']}"
         for ref in reference_list
@@ -6530,7 +6575,7 @@ async def naive_query(
 
     sys_prompt = sys_prompt_template.format(
         response_type=query_param.response_type,
-        user_prompt=user_prompt,
+        user_prompt=f"{user_prompt}{multimodal_answer_hint(context_content or '')}",
         content_data=context_content,
     )
 
@@ -6574,6 +6619,7 @@ async def naive_query(
             history_messages=query_param.conversation_history,
             enable_cot=True,
             stream=query_param.stream,
+            token_tracker=token_tracker,
         )
 
         if (

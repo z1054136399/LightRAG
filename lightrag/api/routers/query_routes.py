@@ -5,8 +5,11 @@ This module contains all query-related routes for the LightRAG API.
 import asyncio
 import json
 import time
-from typing import Any, Dict, List, Literal, Optional
-from fastapi import APIRouter, Depends
+from pathlib import Path
+from typing import Annotated, Any, Dict, List, Literal, Optional
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import Path as FastAPIPath
+from lightrag import LightRAG
 from lightrag.base import QueryParam
 from lightrag.api.input_limits import count_conversation_input_chars
 from lightrag.api.utils_api import get_combined_auth_dependency, internal_server_error
@@ -21,6 +24,11 @@ from lightrag.constants import (
     MAX_REQUEST_TEXT_CHARS,
     MAX_RESPONSE_TYPE_CHARS,
     MAX_ROLE_CHARS,
+)
+from lightrag.api.routers.multimodal_routes import (
+    inject_image_urls,
+    is_multimodal_enabled,
+    resolve_public_base,
 )
 from lightrag.utils import logger
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -224,7 +232,7 @@ class QueryRequest(BaseModel):
         # Exclude API-level parameters that don't belong in QueryParam
         request_data = self.model_dump(
             exclude_none=True,
-            exclude={"query", "include_chunk_content", "include_progress"},
+            exclude={"query", "include_chunk_content", "include_progress", "kbs"},
         )
 
         # Ensure `mode` and `stream` are set explicitly
@@ -255,6 +263,14 @@ class QueryResponse(BaseModel):
     response_time: Optional[float] = Field(
         default=None,
         description="Total server-side processing time in seconds (retrieval + LLM generation)",
+    )
+    input_tokens: Optional[int] = Field(
+        default=None,
+        description="LLM input (prompt) token count for this query",
+    )
+    output_tokens: Optional[int] = Field(
+        default=None,
+        description="LLM output (completion) token count for this query",
     )
 
 
@@ -306,7 +322,19 @@ class StreamChunkResponse(BaseModel):
     )
 
 
-def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
+def _stem_from_filepath(file_path: str) -> str:
+    """Extract the parsed-dir stem from a reference ``file_path``.
+
+    References report the bare source name (e.g. ``img_doc.pdf``); parsed
+    artifacts live in ``<INPUT_DIR>/__parsed__/<file_path>.parsed``. Returning
+    the base name lets the ``/multimodal`` route locate that directory.
+    """
+    if not file_path:
+        return ""
+    return Path(file_path).name
+
+
+def create_query_routes(rag: LightRAG | None = None, api_key: Optional[str] = None, top_k: int = 60, *, kb_registry=None, input_dir: str | None = None):
     # Fresh router per call. A module-level instance would accumulate
     # duplicate routes when the factory is invoked more than once in the
     # same process (e.g. across tests), which triggers FastAPI's
@@ -314,6 +342,22 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
     router = APIRouter(tags=["query"])
 
     combined_auth = get_combined_auth_dependency(api_key)
+
+    if kb_registry is not None:
+        from lightrag.api.kb_registry import KBNotFoundError
+        async def _get_rag(kb_id: str = FastAPIPath(...)) -> LightRAG:
+            try:
+                return await kb_registry.get_rag(kb_id)
+            except KBNotFoundError:
+                raise HTTPException(status_code=404, detail=f"KB not found: {kb_id}")
+        _rag_default = None
+    else:
+        _captured_rag = rag
+        async def _get_rag() -> LightRAG:
+            return _captured_rag
+        _rag_default = _captured_rag
+
+    RagDep = Annotated[LightRAG, Depends(_get_rag)]
 
     @router.post(
         "/query",
@@ -444,7 +488,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text(request: QueryRequest):
+    async def query_text(request: QueryRequest, http_req: Request, rag: RagDep = _rag_default):
         """
         Comprehensive RAG query endpoint with non-streaming response. Parameter "stream" is ignored.
 
@@ -526,6 +570,8 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             )  # Ensure stream=False for non-streaming endpoint
             # Force stream=False for /query endpoint regardless of include_references setting
             param.stream = False
+            if is_multimodal_enabled():
+                param.multimodal_public_base = resolve_public_base(http_req)
             # Unified approach: always use aquery_llm for both cases
             start_time = time.perf_counter()
             result = await rag.aquery_llm(request.query, param=param)
@@ -555,14 +601,28 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
 
                 # Add content to references
                 enriched_references = []
+                public_base = resolve_public_base(http_req) if is_multimodal_enabled() else ""
                 for ref in references:
                     ref_copy = ref.copy()
                     ref_id = ref.get("reference_id", "")
                     if ref_id in ref_id_to_content:
                         # Keep content as a list of chunks (one file may have multiple chunks)
-                        ref_copy["content"] = ref_id_to_content[ref_id]
+                        chunks = ref_id_to_content[ref_id]
+                        if is_multimodal_enabled():
+                            doc_stem = _stem_from_filepath(ref.get("file_path", ""))
+                            chunks = [inject_image_urls(c, doc_stem, public_base) for c in chunks]
+                        ref_copy["content"] = chunks
                     enriched_references.append(ref_copy)
                 references = enriched_references
+
+            # Read actual token counts from the LLM API tracker.
+            token_tracker = result.get("token_tracker")
+            est_input_tokens: int | None = None
+            est_output_tokens: int | None = None
+            if token_tracker is not None and token_tracker.call_count > 0:
+                usage = token_tracker.get_usage()
+                est_input_tokens = usage["prompt_tokens"]
+                est_output_tokens = usage["completion_tokens"]
 
             # Return response with or without references based on request
             if request.include_references:
@@ -570,12 +630,16 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     response=response_content,
                     references=references,
                     response_time=response_time,
+                    input_tokens=est_input_tokens,
+                    output_tokens=est_output_tokens,
                 )
             else:
                 return QueryResponse(
                     response=response_content,
                     references=None,
                     response_time=response_time,
+                    input_tokens=est_input_tokens,
+                    output_tokens=est_output_tokens,
                 )
         except Exception as e:
             logger.error(f"Error processing query: {str(e)}", exc_info=True)
@@ -588,6 +652,8 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
         include_chunk_content: bool,
         include_response_time: bool,
         start_time: float,
+        public_base: str = "",
+        multimodal: bool = False,
     ):
         """Shared async generator that yields NDJSON lines for streaming responses.
 
@@ -617,7 +683,11 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     ref_copy = ref.copy()
                     ref_id = ref.get("reference_id", "")
                     if ref_id in ref_id_to_content:
-                        ref_copy["content"] = ref_id_to_content[ref_id]
+                        chunks = ref_id_to_content[ref_id]
+                        if multimodal and public_base:
+                            doc_stem = _stem_from_filepath(ref.get("file_path", ""))
+                            chunks = [inject_image_urls(c, doc_stem, public_base) for c in chunks]
+                        ref_copy["content"] = chunks
                     enriched_references.append(ref_copy)
                 references = enriched_references
 
@@ -648,9 +718,22 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                 yield f"{json.dumps(complete_response)}\n"
 
             if include_response_time:
-                # Final metadata line: total server-side processing time
-                # (retrieval + LLM generation) for opted-in clients.
-                yield f"{json.dumps({'response_time': round(time.perf_counter() - start_time, 3)})}\n"
+                # Read actual token counts from the LLM API via the tracker.
+                # For streaming the tracker is populated once the iterator above
+                # is fully consumed; for non-streaming it was already populated
+                # before this generator ran.
+                token_tracker = result.get("token_tracker")
+                input_tokens: int | None = None
+                output_tokens: int | None = None
+                if token_tracker is not None and token_tracker.call_count > 0:
+                    usage = token_tracker.get_usage()
+                    input_tokens = usage["prompt_tokens"]
+                    output_tokens = usage["completion_tokens"]
+                metadata: dict = {"response_time": round(time.perf_counter() - start_time, 3)}
+                if input_tokens is not None:
+                    metadata["input_tokens"] = input_tokens
+                    metadata["output_tokens"] = output_tokens
+                yield f"{json.dumps(metadata)}\n"
 
         return _generate
 
@@ -733,7 +816,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_text_stream(request: QueryRequest):
+    async def query_text_stream(request: QueryRequest, http_req: Request, rag: RagDep = _rag_default):
         """
         Advanced RAG query endpoint with flexible streaming response.
 
@@ -889,6 +972,11 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             stream_mode = request.stream if request.stream is not None else True
             param = request.to_query_params(stream_mode)
 
+            multimodal = is_multimodal_enabled()
+            public_base = resolve_public_base(http_req) if multimodal else ""
+            if multimodal:
+                param.multimodal_public_base = public_base
+
             from fastapi.responses import StreamingResponse
 
             start_time = time.perf_counter()
@@ -965,6 +1053,8 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                             include_chunk_content=include_chunk_content,
                             include_response_time=True,
                             start_time=start_time,
+                            public_base=public_base,
+                            multimodal=multimodal,
                         )
                         async for line in stream_gen():
                             yield line
@@ -994,6 +1084,8 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
                     include_chunk_content=request.include_chunk_content,
                     include_response_time=False,
                     start_time=start_time,
+                    public_base=public_base,
+                    multimodal=multimodal,
                 )
 
                 return StreamingResponse(
@@ -1306,7 +1398,7 @@ def create_query_routes(rag, api_key: Optional[str] = None, top_k: int = 60):
             },
         },
     )
-    async def query_data(request: QueryRequest):
+    async def query_data(request: QueryRequest, rag: RagDep = _rag_default):
         """
         Advanced data retrieval endpoint for structured RAG analysis.
 

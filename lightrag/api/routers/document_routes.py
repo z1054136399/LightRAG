@@ -6,6 +6,7 @@ import asyncio
 import base64
 import binascii
 import errno
+import json
 import math
 import os
 import re
@@ -42,6 +43,7 @@ from fastapi import (
     APIRouter,
     Depends,
     File,
+    Form,
     HTTPException,
     Query,
     Request,
@@ -2328,6 +2330,8 @@ async def pipeline_enqueue_file(
     from_scan: bool = False,
     admission_token: str | None = None,
     known_file_size: int | None = None,
+    override_process_options: str | None = None,
+    override_chunk_options: dict | None = None,
 ) -> tuple[bool, str]:
     """Add a file to the queue for processing
 
@@ -2347,6 +2351,12 @@ async def pipeline_enqueue_file(
             candidate spool recorded at discovery time; it feeds error reports
             only, so a size that went stale between discovery and enqueue costs
             nothing.
+        override_process_options: when set, replaces the process_options string
+            derived from filename hints (e.g. ``"F"`` for fixed-token). The
+            filename still determines the parser engine.
+        override_chunk_options: when set, replaces the chunk_options dict built
+            from filename hints. Takes precedence over both the hint-derived
+            options and the server's addon_params defaults for this file.
     Returns:
         tuple: (success: bool, track_id: str)
     """
@@ -2405,15 +2415,22 @@ async def pipeline_enqueue_file(
 
         extraction_engine = directives.engine
         process_options = directives.process_options
-        api_process_options = process_options or PROCESS_OPTION_CHUNK_FIXED
+        # override_process_options (from the upload request) wins over the
+        # filename-hint-derived value; absent overrides reproduce legacy behavior.
+        api_process_options = override_process_options or process_options or PROCESS_OPTION_CHUNK_FIXED
 
         # Overlay any per-file chunk parameters (from the filename hint or a
         # LIGHTRAG_PARSER rule) onto the active strategy's chunk_options so the
         # parse worker chunks this document with them. Absent params keep the
         # legacy path (chunk_options built at enqueue time from addon_params).
-        hint_chunk_options = None
-        active_strategy = parse_process_options(api_process_options).chunking
-        hint_chunk_params = directives.chunk_params.get(active_strategy)
+        # When the caller supplied an override_chunk_options dict, it already
+        # encodes the fully-resolved options and hints are skipped entirely.
+        hint_chunk_options = override_chunk_options
+        if hint_chunk_options is None:
+            active_strategy = parse_process_options(api_process_options).chunking
+            hint_chunk_params = directives.chunk_params.get(active_strategy)
+        else:
+            hint_chunk_params = None
         if hint_chunk_params:
             try:
                 strategy_key = chunk_strategy_key(api_process_options)
@@ -2526,6 +2543,8 @@ async def pipeline_index_file(
     file_path: Path,
     track_id: str = None,
     admission_token: str | None = None,
+    override_process_options: str | None = None,
+    override_chunk_options: dict | None = None,
 ):
     """Index a file with track_id
 
@@ -2536,10 +2555,19 @@ async def pipeline_index_file(
         admission_token: the endpoint's pending-enqueue reservation, forwarded
             so the admission guard re-weights THAT token to the deduped count
             instead of counting this request twice (LR2 §9.2)
+        override_process_options: forwarded to pipeline_enqueue_file; overrides
+            the filename-hint-derived chunking strategy.
+        override_chunk_options: forwarded to pipeline_enqueue_file; overrides
+            the fully-resolved chunk_options dict for this file.
     """
     try:
         success, _ = await pipeline_enqueue_file(
-            rag, file_path, track_id, admission_token=admission_token
+            rag,
+            file_path,
+            track_id,
+            admission_token=admission_token,
+            override_process_options=override_process_options,
+            override_chunk_options=override_chunk_options,
         )
         if success:
             await rag.apipeline_process_enqueue_documents()
@@ -4324,7 +4352,13 @@ async def background_delete_documents(
 
 
 def create_document_routes(
-    rag: LightRAG, doc_manager: DocumentManager, api_key: Optional[str] = None
+    rag: LightRAG | None = None,
+    doc_manager: DocumentManager | None = None,
+    api_key: Optional[str] = None,
+    kb_meta: Optional[Any] = None,
+    *,
+    kb_registry=None,
+    input_dir: str | None = None,
 ):
     # Fresh router per call — see the note above the temp_prefix constant.
     router = APIRouter(
@@ -4335,11 +4369,47 @@ def create_document_routes(
     # Create combined auth dependency for document routes
     combined_auth = get_combined_auth_dependency(api_key)
 
+    if kb_registry is not None:
+        from lightrag.api.kb_registry import KBNotFoundError
+        from fastapi import Path as _ApiPath
+
+        async def _get_rag(kb_id: str = _ApiPath(...)) -> LightRAG:
+            try:
+                return await kb_registry.get_rag(kb_id)
+            except KBNotFoundError:
+                raise HTTPException(status_code=404, detail=f"KB not found: {kb_id}")
+
+        def _get_doc_manager(kb_id: str = _ApiPath(...)) -> DocumentManager:
+            return DocumentManager(input_dir, workspace=kb_id)
+
+        _rag_default = None
+        _dm_default = None
+    else:
+        _captured_rag = rag
+        _captured_dm = doc_manager
+
+        async def _get_rag() -> LightRAG:
+            return _captured_rag
+
+        def _get_doc_manager() -> DocumentManager:
+            return _captured_dm
+
+        # When endpoints are called directly (e.g. in tests), use captured values
+        # as defaults. FastAPI always resolves Depends, so these only matter for
+        # direct Python calls that bypass FastAPI's dependency injection.
+        _rag_default = _captured_rag
+        _dm_default = _captured_dm
+
+    RagDep = Annotated[LightRAG, Depends(_get_rag)]
+    DocManagerDep = Annotated[DocumentManager, Depends(_get_doc_manager)]
+
     @router.post(
         "/scan", response_model=ScanResponse, dependencies=[Depends(combined_auth)]
     )
     async def scan_for_new_documents(
         managed_tasks: set = Depends(get_managed_background_tasks),
+        rag: RagDep = _rag_default,
+        doc_manager: DocManagerDep = _dm_default,
     ):
         """
         Trigger the scanning process for new documents.
@@ -4709,7 +4779,7 @@ def create_document_routes(
         response_model=ScanJobStatusResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_scan_job_status(track_id: str):
+    async def get_scan_job_status(track_id: str, rag: RagDep = _rag_default):
         """
         Report the bounded status of one scan job (LR2 §8.6).
 
@@ -4761,6 +4831,7 @@ def create_document_routes(
         cursor: Optional[str] = Query(
             None, description="next_cursor from a previous page (opaque)"
         ),
+        rag: RagDep = _rag_default,
     ):
         """
         List canonical source keys claimed by more than one primary document.
@@ -4829,6 +4900,7 @@ def create_document_routes(
     async def repair_source_conflict(
         payload: SourceConflictRepairRequest,
         http_request: Request,
+        rag: RagDep = _rag_default,
     ):
         """
         Settle one source conflict by naming the document that keeps the source.
@@ -5057,6 +5129,43 @@ def create_document_routes(
         managed_tasks: set = Depends(get_managed_background_tasks),
         file: UploadFile = File(...),
         http_request: Request = None,
+        chunking_strategy: Optional[str] = Form(
+            default=None,
+            description=(
+                "Chunking strategy override for this file. "
+                "One of: fixed_token, recursive_character, semantic_vector, paragraph_semantic. "
+                "Omit to use the knowledge base default (or server default if none is set)."
+            ),
+        ),
+        chunk_token_size: Optional[int] = Form(
+            default=None,
+            ge=1,
+            description="Target chunk size in tokens. Omit to use the KB/server default.",
+        ),
+        chunk_overlap_token_size: Optional[int] = Form(
+            default=None,
+            ge=0,
+            description="Overlap between consecutive chunks in tokens. Omit to use the KB/server default.",
+        ),
+        split_by_character: Optional[str] = Form(
+            default=None,
+            description=(
+                "Delimiter string for fixed_token strategy. "
+                "The document is first split on this character; oversized segments are further "
+                "split by the token window. Supports escape sequences (\\n, \\t). "
+                "Ignored for strategies other than fixed_token."
+            ),
+        ),
+        separators: Optional[str] = Form(
+            default=None,
+            description=(
+                "JSON-encoded list of separator strings for recursive_character strategy, "
+                "e.g. '[\"\\\\n\\\\n\", \"\\\\n\", \" \"]'. "
+                "Ignored for strategies other than recursive_character."
+            ),
+        ),
+        rag: RagDep = _rag_default,
+        doc_manager: DocManagerDep = _dm_default,
     ):
         """
         Upload a file to the input directory and index it.
@@ -5133,6 +5242,16 @@ def create_document_routes(
                 flight, 413 file too large, 500 other errors.
         """
         from lightrag.kg.shared_storage import start_reserved_background_task
+        from fastapi.params import FieldInfo as _FieldInfo
+
+        # When called directly in tests (bypassing FastAPI DI), Form(...)
+        # default values arrive as FieldInfo objects. Coerce them to None.
+        if isinstance(chunking_strategy, _FieldInfo):
+            chunking_strategy = None
+        if isinstance(chunk_token_size, _FieldInfo):
+            chunk_token_size = None
+        if isinstance(chunk_overlap_token_size, _FieldInfo):
+            chunk_overlap_token_size = None
 
         enqueue_token, admission_adopted = _adopt_or_new_enqueue_token(http_request)
         handed_off = False
@@ -5304,6 +5423,59 @@ def create_document_routes(
 
             track_id = generate_track_id("upload")
 
+            # Resolve effective chunking: explicit request params > KB default > server default.
+            # Priority: (1) explicit form fields win; (2) kb_meta.default_chunking fills in
+            # missing fields; (3) None falls through to _resolve_text_chunking's server defaults.
+            _upload_override_po: Optional[str] = None
+            _upload_override_co: Optional[dict] = None
+            _req_has_chunking = (
+                chunking_strategy is not None
+                or chunk_token_size is not None
+                or chunk_overlap_token_size is not None
+                or split_by_character is not None
+                or separators is not None
+            )
+            _kb_has_default = (
+                kb_meta is not None
+                and isinstance(getattr(kb_meta, "default_chunking", None), dict)
+            )
+            if _req_has_chunking or _kb_has_default:
+                # Build a TextChunkingConfig from the effective params.
+                _effective_strategy = (
+                    chunking_strategy
+                    or (kb_meta.default_chunking.get("strategy") if _kb_has_default else None)
+                    or "fixed_token"
+                )
+                _kb_params = (kb_meta.default_chunking.get("params") or {}) if _kb_has_default else {}
+                _effective_params = dict(_kb_params)  # start from KB defaults
+                # Request params override KB defaults
+                if chunk_token_size is not None:
+                    _effective_params["chunk_token_size"] = chunk_token_size
+                if chunk_overlap_token_size is not None:
+                    _effective_params["chunk_overlap_token_size"] = chunk_overlap_token_size
+                if split_by_character is not None and _effective_strategy == "fixed_token":
+                    _effective_params["split_by_character"] = split_by_character
+                if separators is not None and _effective_strategy == "recursive_character":
+                    try:
+                        _sep_list = json.loads(separators)
+                        if isinstance(_sep_list, list):
+                            _effective_params["separators"] = _sep_list
+                    except (json.JSONDecodeError, ValueError):
+                        raise HTTPException(
+                            status_code=422,
+                            detail="separators must be a valid JSON array of strings",
+                        )
+                try:
+                    _chunking_cfg = TextChunkingConfig(
+                        strategy=_effective_strategy,
+                        params=_effective_params,
+                    )
+                    _upload_override_po, _upload_override_co = _resolve_text_chunking(
+                        _chunking_cfg, rag
+                    )
+                except ValueError as _e:
+                    raise HTTPException(status_code=422, detail=str(_e))
+
             # Bg task: enqueue + trigger processing, then release the slot.
             # ``pipeline_index_file`` does both: it calls
             # ``pipeline_enqueue_file`` (writes doc_status / full_docs) and
@@ -5323,6 +5495,8 @@ def create_document_routes(
                         file_path,
                         track_id,
                         admission_token=enqueue_token,
+                        override_process_options=_upload_override_po,
+                        override_chunk_options=_upload_override_co,
                     )
                 finally:
                     await _release_enqueue_slot(rag, enqueue_token)
@@ -5367,6 +5541,7 @@ def create_document_routes(
         request: InsertTextRequest,
         managed_tasks: set = Depends(get_managed_background_tasks),
         http_request: Request = None,
+        rag: RagDep = _rag_default,
     ):
         """
         Insert text into the RAG system.
@@ -5497,6 +5672,7 @@ def create_document_routes(
         request: InsertTextsRequest,
         managed_tasks: set = Depends(get_managed_background_tasks),
         http_request: Request = None,
+        rag: RagDep = _rag_default,
     ):
         """
         Insert multiple texts into the RAG system.
@@ -5653,7 +5829,7 @@ def create_document_routes(
     @router.delete(
         "", response_model=ClearDocumentsResponse, dependencies=[Depends(combined_auth)]
     )
-    async def clear_documents():
+    async def clear_documents(rag: RagDep = _rag_default, doc_manager: DocManagerDep = _dm_default):
         """
         Clear all documents from the RAG system.
 
@@ -5971,7 +6147,7 @@ def create_document_routes(
         dependencies=[Depends(combined_auth)],
         response_model=PipelineStatusResponse,
     )
-    async def get_pipeline_status() -> PipelineStatusResponse:
+    async def get_pipeline_status(rag: RagDep = _rag_default) -> PipelineStatusResponse:
         """
         Get the current status of the document indexing pipeline.
 
@@ -6008,9 +6184,19 @@ def create_document_routes(
             )
 
             # Get update flags status for all namespaces
-            processed_update_status = await get_all_update_flags_status(
-                workspace=rag.workspace
-            )
+            update_status = await get_all_update_flags_status(workspace=rag.workspace)
+
+            # Convert MutableBoolean objects to regular boolean values
+            processed_update_status = {}
+            for namespace, flags in update_status.items():
+                processed_flags = []
+                for flag in flags:
+                    # Handle both multiprocess and single process cases
+                    if hasattr(flag, "value"):
+                        processed_flags.append(bool(flag.value))
+                    else:
+                        processed_flags.append(bool(flag))
+                processed_update_status[namespace] = processed_flags
 
             async with pipeline_status_lock:
                 # DictProxy.copy() is one Manager RPC; dict(proxy) may fetch
@@ -6082,7 +6268,7 @@ def create_document_routes(
     @router.get(
         "", response_model=DocsStatusesResponse, dependencies=[Depends(combined_auth)]
     )
-    async def documents() -> DocsStatusesResponse:
+    async def documents(rag: RagDep = _rag_default) -> DocsStatusesResponse:
         """
         Get the status of all documents in the system. This endpoint is deprecated; use /documents/paginated instead.
         To prevent excessive resource consumption, a maximum of 1,000 records is returned.
@@ -6200,6 +6386,8 @@ def create_document_routes(
     async def delete_document(
         delete_request: DeleteDocRequest,
         managed_tasks: set = Depends(get_managed_background_tasks),
+        rag: RagDep = _rag_default,
+        doc_manager: DocManagerDep = _dm_default,
     ) -> DeleteDocByIdResponse:
         """
         Delete documents and all their associated data by their IDs using background processing.
@@ -6323,7 +6511,7 @@ def create_document_routes(
         response_model=ClearCacheResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def clear_cache(request: ClearCacheRequest):
+    async def clear_cache(request: ClearCacheRequest, rag: RagDep = _rag_default):
         """
         Clear all cache data from the LLM response cache storage.
 
@@ -6357,7 +6545,7 @@ def create_document_routes(
         response_model=TrackStatusResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_track_status(track_id: str) -> TrackStatusResponse:
+    async def get_track_status(track_id: str, rag: RagDep = _rag_default) -> TrackStatusResponse:
         """
         Get the processing status of documents by tracking ID.
 
@@ -6433,6 +6621,7 @@ def create_document_routes(
     )
     async def get_documents_paginated(
         request: DocumentsRequest,
+        doc_manager: DocManagerDep = _dm_default,
     ) -> PaginatedDocsResponse:
         """
         Get documents with pagination support.
@@ -6612,7 +6801,7 @@ def create_document_routes(
         response_model=StatusCountsResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def get_document_status_counts() -> StatusCountsResponse:
+    async def get_document_status_counts(rag: RagDep = _rag_default) -> StatusCountsResponse:
         """
         Get counts of documents by status.
 
@@ -6641,6 +6830,7 @@ def create_document_routes(
     )
     async def get_supported_file_types(
         response: Response,
+        rag: RagDep = _rag_default,
     ) -> SupportedFileTypesResponse:
         """
         Get the upload allowlist and the parser capability matrix.
@@ -6673,6 +6863,7 @@ def create_document_routes(
     )
     async def reprocess_failed_documents(
         managed_tasks: set = Depends(get_managed_background_tasks),
+        rag: RagDep = _rag_default,
     ):
         """
         Reprocess existing failed, pending, or interrupted document records
@@ -6822,6 +7013,7 @@ def create_document_routes(
     )
     async def force_reset_recovery(
         request: ForceResetRecoveryRequest,
+        rag: RagDep = _rag_default,
     ) -> ForceResetRecoveryResponse:
         """Force-clear a ``recovery_required`` fence (UNSAFE, manual).
 
@@ -7000,7 +7192,7 @@ def create_document_routes(
         response_model=CancelPipelineResponse,
         dependencies=[Depends(combined_auth)],
     )
-    async def cancel_pipeline():
+    async def cancel_pipeline(rag: RagDep = _rag_default):
         """
         Request cancellation of the currently running pipeline.
 

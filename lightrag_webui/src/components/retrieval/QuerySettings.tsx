@@ -1,5 +1,6 @@
-import { useCallback, useMemo } from 'react'
+import { useCallback, useMemo, useState } from 'react'
 import { QueryMode, QueryRequest } from '@/api/lightrag'
+import type { KBMeta } from '@/api/kb'
 // Removed unused import for Text component
 import Checkbox from '@/components/ui/Checkbox'
 import Input from '@/components/ui/Input'
@@ -13,10 +14,11 @@ import {
   SelectTrigger,
   SelectValue
 } from '@/components/ui/Select'
+import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/Popover'
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/Tooltip'
 import { useSettingsStore } from '@/stores/settings'
 import { useTranslation } from 'react-i18next'
-import { RotateCcw } from 'lucide-react'
+import { RotateCcw, ChevronDownIcon } from 'lucide-react'
 import { cn } from '@/lib/utils'
 
 const ResetButton = ({ onClick, title }: { onClick: () => void; title: string }) => (
@@ -39,10 +41,25 @@ const ResetButton = ({ onClick, title }: { onClick: () => void; title: string })
   </TooltipProvider>
 )
 
-export default function QuerySettings() {
+interface QuerySettingsProps {
+  availableKBs?: KBMeta[]
+  selectedKbIds?: string[]
+  onToggleKb?: (kbId: string) => void
+  kbError?: string
+  disabled?: boolean
+}
+
+export default function QuerySettings({
+  availableKBs,
+  selectedKbIds,
+  onToggleKb,
+  kbError,
+  disabled,
+}: QuerySettingsProps = {}) {
   const { t } = useTranslation()
   const querySettings = useSettingsStore((state) => state.querySettings)
   const userPromptHistory = useSettingsStore((state) => state.userPromptHistory)
+  const [kbPopoverOpen, setKbPopoverOpen] = useState(false)
 
   const handleChange = useCallback((key: keyof QueryRequest, value: any) => {
     useSettingsStore.getState().updateQuerySettings({ [key]: value })
@@ -86,6 +103,59 @@ export default function QuerySettings() {
       <CardContent className="m-0 flex grow flex-col p-0 text-xs">
         <div className="relative size-full">
           <div className="absolute inset-0 flex flex-col gap-2 overflow-auto px-2 pr-2">
+            {/* KB multi-select — only on search tab */}
+            {availableKBs && selectedKbIds && onToggleKb && (
+              <>
+                <label className="ml-1 text-xs">{t('globalSearch.selectKBs')}</label>
+                <Popover open={kbPopoverOpen} onOpenChange={setKbPopoverOpen}>
+                  <PopoverTrigger asChild>
+                    <button
+                      type="button"
+                      disabled={disabled}
+                      className={cn(
+                        'hover:bg-primary/5 h-9 w-full cursor-pointer rounded-md border border-input bg-transparent px-3 py-2 text-left text-xs flex items-center justify-between',
+                        disabled && 'cursor-not-allowed opacity-50'
+                      )}
+                    >
+                      <span className="flex-1 truncate leading-none">
+                        {selectedKbIds.length === 0
+                          ? t('globalSearch.noKBSelected')
+                          : selectedKbIds.length === availableKBs.length
+                            ? t('globalSearch.allKBs')
+                            : selectedKbIds.length === 1
+                              ? (availableKBs.find((kb) => kb.id === selectedKbIds[0])?.name ?? selectedKbIds[0])
+                              : t('globalSearch.nKBsSelected', { count: selectedKbIds.length })}
+                      </span>
+                      <ChevronDownIcon className="ml-1 size-3 shrink-0 text-muted-foreground" />
+                    </button>
+                  </PopoverTrigger>
+                  <PopoverContent
+                    className="w-[240px] p-2"
+                    align="start"
+                    side="bottom"
+                    avoidCollisions={true}
+                  >
+                    <div className="flex flex-col gap-1">
+                      {availableKBs.map((kb) => (
+                        <label
+                          key={kb.id}
+                          className="flex items-center gap-2 cursor-pointer rounded px-1 py-1 text-xs hover:bg-accent"
+                        >
+                          <Checkbox
+                            checked={selectedKbIds.includes(kb.id)}
+                            onCheckedChange={() => onToggleKb(kb.id)}
+                            className="size-3.5"
+                          />
+                          <span className="truncate">{kb.name}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </PopoverContent>
+                </Popover>
+                {kbError && <p className="ml-1 text-xs text-red-500">{kbError}</p>}
+              </>
+            )}
+
             {/* User Prompt - Moved to top for better dropdown space */}
             <>
               <TooltipProvider>

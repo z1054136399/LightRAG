@@ -6,6 +6,7 @@ import StatusIndicator from '@/components/status/StatusIndicator'
 import { SiteInfo, webuiPrefix } from '@/lib/constants'
 import { useBackendState, useAuthStore } from '@/stores/state'
 import { useSettingsStore } from '@/stores/settings'
+import { useKBStore } from '@/stores/kb'
 import { getAuthStatus } from '@/api/lightrag'
 import SiteHeader from '@/features/SiteHeader'
 import { InvalidApiKeyError, RequireApiKeError } from '@/api/lightrag'
@@ -13,7 +14,9 @@ import { ZapIcon } from 'lucide-react'
 
 import GraphViewer from '@/features/GraphViewer'
 import DocumentManager from '@/features/DocumentManager'
+import KnowledgeBasePanel from '@/features/KnowledgeBasePanel'
 import RetrievalView from '@/features/RetrievalView'
+import GlobalSearchView from '@/features/GlobalSearchView'
 import ApiSite from '@/features/ApiSite'
 
 import { Tabs, TabsContent } from '@/components/ui/Tabs'
@@ -154,6 +157,24 @@ function App() {
     []
   )
 
+  // Sync tab with KB state:
+  // - Leaving a KB: redirect away from KB-only tabs (knowledge-graph, retrieval)
+  // - Entering a KB: redirect away from global search (search) to KB retrieval,
+  //   since the search tab is hidden inside a KB and its label would be confusing
+  const activeKbId = useKBStore((s) => s.activeKbId)
+  useEffect(() => {
+    const tab = useSettingsStore.getState().currentTab
+    if (!activeKbId) {
+      if (tab === 'knowledge-graph' || tab === 'retrieval') {
+        useSettingsStore.getState().setCurrentTab('documents')
+      }
+    } else {
+      if (tab === 'search') {
+        useSettingsStore.getState().setCurrentTab('retrieval')
+      }
+    }
+  }, [activeKbId])
+
   // React to backend message changes during render rather than via useEffect
   // (avoids cascading renders flagged by react-hooks/set-state-in-effect)
   const [previousMessage, setPreviousMessage] = useState(message)
@@ -207,13 +228,20 @@ function App() {
               <SiteHeader />
               <div className="relative grow">
                 <TabsContent value="documents" className="absolute top-0 right-0 bottom-0 left-0 overflow-auto">
-                  <DocumentManager />
+                  <KnowledgeBasePanel />
                 </TabsContent>
-                <TabsContent value="knowledge-graph" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
-                  <GraphViewer />
-                </TabsContent>
-                <TabsContent value="retrieval" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
-                  <RetrievalView />
+                {activeKbId && (
+                  <TabsContent value="knowledge-graph" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
+                    <GraphViewer />
+                  </TabsContent>
+                )}
+                {activeKbId && (
+                  <TabsContent value="retrieval" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
+                    <RetrievalView />
+                  </TabsContent>
+                )}
+                <TabsContent value="search" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
+                  <GlobalSearchView />
                 </TabsContent>
                 <TabsContent value="api" className="absolute top-0 right-0 bottom-0 left-0 overflow-hidden">
                   <ApiSite />

@@ -5137,6 +5137,14 @@ class _PipelineMixin:
                         f"got {type(chunking_result)}"
                     )
 
+                # Repair any <drawing> tags that were split across chunk
+                # boundaries by the token-based chunker.  Must run before
+                # build_chunks_dict_from_chunking_result so the stored chunk
+                # content always contains whole, convertible tags.
+                from lightrag.utils_pipeline import repair_split_drawing_tags
+
+                repair_split_drawing_tags(chunking_result)
+
                 # Reflect the format actually persisted in full_docs.
                 # Previously a structured-parse fallback always tagged
                 # parse_format=raw, which silently mislabelled lightrag docs;
@@ -6676,6 +6684,20 @@ class _PipelineMixin:
                 value = _normalize_text(surrounding.get(key))
                 return value or "n/a"
 
+            def _resolve_image_path(
+                path_str: str | None, sidecar_dir: Path
+            ) -> Path | None:
+                if not path_str:
+                    return None
+                candidate = Path(path_str)
+                if not candidate.is_absolute():
+                    sidecar_candidate = sidecar_dir / path_str
+                    if sidecar_candidate.exists() and sidecar_candidate.is_file():
+                        candidate = sidecar_candidate
+                if candidate.exists() and candidate.is_file():
+                    return candidate
+                return None
+
             def _failure_result(message: str) -> dict[str, Any]:
                 return {
                     "analyze_time": int(time.time()),
@@ -7673,6 +7695,23 @@ class _PipelineMixin:
 
                 if not chunk_content:
                     continue
+
+                # Prepend a <drawing id="..." path="..."/> marker to drawing
+                # chunks so inject_image_urls can attach a /multimodal/ URL
+                # at query time.  The tag carries the same id that the sidecar
+                # router uses to look up the file, so the URL is always valid.
+                if kind == "drawing":
+                    item_path = (
+                        item.get("path")
+                        or item.get("img_path")
+                        or item.get("src")
+                        or ""
+                    )
+                    _tag = f'<drawing id="{item_id}"'
+                    if item_path:
+                        _tag += f' path="{item_path}"'
+                    _tag += " />"
+                    chunk_content = f"{_tag}\n{chunk_content}"
 
                 heading_dict = _build_heading_dict(item)
                 sidecar_block = {

@@ -21,7 +21,7 @@ import time
 import uuid
 import uvicorn
 import pipmaster as pm
-from typing import Any
+from typing import Any, Optional
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
 from pathlib import Path
@@ -55,7 +55,13 @@ from lightrag.constants import (
     DEFAULT_LOG_BACKUP_COUNT,
     DEFAULT_LOG_FILENAME,
 )
-from lightrag.api.routers.document_routes import (
+# DocumentManager/create_document_routes/create_query_routes/create_graph_routes
+# are no longer called directly in this module — document/query/graph routes
+# are mounted per-KB by KBRegistry._mount instead (see kb_registry.py). The
+# names are kept as module attributes because several tests under tests/api/
+# (e.g. test_health_auth.py, test_login_route.py) monkeypatch them via
+# `monkeypatch.setattr(lightrag_server, "create_document_routes", ...)`.
+from lightrag.api.routers.document_routes import (  # noqa: F401
     DocumentManager,
     create_document_routes,
 )
@@ -67,8 +73,9 @@ from lightrag.parser.routing import (
     validate_smart_heading_dependencies,
 )
 from lightrag.parser.external.mineru.cache import MinerUParserOptions
-from lightrag.api.routers.query_routes import create_query_routes
-from lightrag.api.routers.graph_routes import create_graph_routes
+from lightrag.api.routers.query_routes import create_query_routes  # noqa: F401
+from lightrag.api.routers.multimodal_routes import create_multimodal_routes
+from lightrag.api.routers.graph_routes import create_graph_routes  # noqa: F401
 from lightrag.api.routers.ollama_api import OllamaAPI
 
 from lightrag.utils import logger, set_verbose_debug
@@ -1355,6 +1362,7 @@ def create_app(args):
             # Initialize database connections
             # Note: initialize_storages() now auto-initializes pipeline_status for rag.workspace
             await rag.initialize_storages()
+            await kb_registry.initialize()
 
             # Data migration regardless of storage implementation
             await rag.check_and_migrate_data()
@@ -1394,6 +1402,7 @@ def create_app(args):
 
             # Clean up database connections
             await rag.finalize_storages()
+            await kb_registry.finalize_all()
 
             if "LIGHTRAG_GUNICORN_MODE" not in os.environ:
                 # Only perform cleanup in Uvicorn single-process mode
@@ -1517,8 +1526,19 @@ def create_app(args):
     # Pre-body admission control (LR2 §9.3). Installed only when there is a
     # capacity to enforce; the ingestion routes keep their own reservation, so an
     # absent middleware costs economy (the body is read before the refusal), not
-    # correctness. ``rag`` is built further down in this function, hence the lazy
-    # getter.
+    # correctness. ``rag`` and ``app.state.kb_registry`` are both built further
+    # down in this function, hence the lazy getter.
+    #
+    # Each knowledge base owns its own pending-documents count (one full
+    # LightRAG instance per KB, mounted by ``KBRegistry._mount``), so the
+    # capacity check must resolve THAT KB's instance for a KB-scoped upload
+    # path rather than always checking the single system ``rag`` kept around
+    # for Ollama-compat/health/admission. A bare, non-KB-scoped path (``kb_id``
+    # is ``None``) still falls back to the system ``rag``, matching the
+    # previous behavior for that case. An unknown ``kb_id`` degrades to
+    # ``None`` (fail-open here) rather than raising: the route itself 404s on
+    # a genuinely missing KB, and a ``None``-returning getter is already
+    # handled gracefully by ``AdmissionMiddleware._resolve_rag``.
     #
     # Added BEFORE the CORS middleware on purpose: the most recently added
     # middleware runs outermost, so CORS ends up wrapping this one and its 401 /
@@ -1526,10 +1546,20 @@ def create_app(args):
     # (without them the WebUI would see an opaque network error instead of "at
     # capacity"). It therefore also sees the un-normalized path, which is why it
     # strips ``api_prefix`` itself.
+    def _admission_rag_getter(kb_id: Optional[str]):
+        if kb_id is None:
+            return rag
+        # get_rag_if_ready is sync and never triggers lazy init; by the time
+        # AdmissionMiddleware calls this, LazyKBInitMiddleware (installed
+        # outside it) has already called _ensure_initialized for the request's
+        # kb_id, so the instance is in the cache. A None return degrades
+        # gracefully: the route's own reservation still enforces capacity.
+        return app.state.kb_registry.get_rag_if_ready(kb_id)
+
     if args.max_pending_documents > 0:
         app.add_middleware(
             AdmissionMiddleware,
-            rag_getter=lambda: rag,
+            rag_getter=_admission_rag_getter,
             api_key=api_key,
             api_prefix=api_prefix,
         )
@@ -2253,11 +2283,15 @@ def create_app(args):
         for spec in ROLES
     }
 
-    # Initialize RAG with unified configuration
-    try:
-        rag = LightRAG(
+    def _build_shared_rag_kwargs() -> dict:
+        """Kwargs shared by every per-KB LightRAG instance. Every KB uses
+        the same LLM/embedding/storage backend configuration (no per-KB
+        model override — see design non-goals); only `workspace` differs.
+        Called once per KB (at startup reload and at creation time), so
+        the underlying factories (`create_llm_model_func`, etc.) must be
+        side-effect-free on repeat calls — true for all of them today."""
+        return dict(
             working_dir=args.working_dir,
-            workspace=args.workspace,
             llm_model_func=create_llm_model_func(args.llm_binding),
             llm_model_name=args.llm_model,
             llm_model_max_async=args.max_async,
@@ -2320,6 +2354,12 @@ def create_app(args):
                 for spec in ROLES
             },
         )
+
+    # Retained for cross-cutting concerns out of the multi-KB design's scope:
+    # Ollama-compatible endpoints, /health introspection, admission-middleware
+    # capacity checks, and role-config reporting. Stores no KB documents.
+    try:
+        rag = LightRAG(workspace=args.workspace, **_build_shared_rag_kwargs())
     except Exception as e:
         logger.error(f"Failed to initialize LightRAG: {e}")
         raise
@@ -2339,6 +2379,59 @@ def create_app(args):
     app.include_router(create_document_routes(rag, doc_manager, api_key))
     app.include_router(create_query_routes(rag, api_key, args.top_k))
     app.include_router(create_graph_routes(rag, api_key))
+
+    from lightrag.api.kb_registry import KBRegistry
+    from lightrag.api.routers.kb_routes import create_kb_routes
+
+    kb_registry = KBRegistry(
+        working_dir=args.working_dir,
+        input_dir=args.input_dir,
+        api_key=api_key,
+        top_k=args.top_k,
+        build_rag_kwargs=_build_shared_rag_kwargs,
+    )
+    app.state.kb_registry = kb_registry
+
+    # KB management routes (CRUD for KBs themselves)
+    app.include_router(create_kb_routes(kb_registry, api_key))
+
+    # KB-scoped routes: single parameterized set instead of per-KB dynamic mounting
+    from lightrag.api.routers.document_routes import create_document_routes as _create_doc_routes
+    from lightrag.api.routers.query_routes import create_query_routes as _create_query_routes
+    from lightrag.api.routers.graph_routes import create_graph_routes as _create_graph_routes
+
+    _kb_prefix = "/api/kbs/{kb_id}"
+    app.include_router(
+        _create_doc_routes(
+            api_key=api_key,
+            kb_registry=kb_registry,
+            input_dir=args.input_dir,
+        ),
+        prefix=_kb_prefix,
+    )
+    app.include_router(
+        _create_query_routes(
+            api_key=api_key,
+            top_k=args.top_k,
+            kb_registry=kb_registry,
+        ),
+        prefix=_kb_prefix,
+    )
+    app.include_router(
+        _create_graph_routes(
+            api_key=api_key,
+            kb_registry=kb_registry,
+        ),
+        prefix=_kb_prefix,
+    )
+    app.include_router(
+        create_multimodal_routes(
+            api_key=api_key,
+            kb_registry=kb_registry,
+            input_dir_base=args.input_dir,
+        ),
+        prefix=_kb_prefix,
+    )
 
     # Add Ollama API routes
     ollama_api = OllamaAPI(rag, top_k=args.top_k, api_key=api_key)
@@ -2496,6 +2589,15 @@ def create_app(args):
             "api_version": api_version_display,
             "webui_title": webui_title,
             "webui_description": webui_description,
+        }
+
+    @app.get("/chunking-defaults", dependencies=[Depends(combined_auth)])
+    async def get_chunking_defaults():
+        """Return the server-level default chunking parameters."""
+        return {
+            "strategy": "fixed_token",
+            "chunk_token_size": int(args.chunk_size),
+            "chunk_overlap_token_size": int(args.chunk_overlap_size),
         }
 
     @app.get(

@@ -1,0 +1,81 @@
+[
+  {
+    "page_idx": 0,
+    "bbox": [
+      600,
+      145,
+      1381,
+      261
+    ],
+    "type": "text",
+    "text": "# Q1 Sales Report",
+    "text_level": 2
+  },
+  {
+    "page_idx": 0,
+    "bbox": [
+      116,
+      384,
+      1799,
+      471
+    ],
+    "type": "text",
+    "text": "- Regional performance overview for Q1 2025."
+  },
+  {
+    "page_idx": 0,
+    "bbox": [
+      116,
+      510,
+      1772,
+      586
+    ],
+    "type": "text",
+    "text": "- North: 320 South: 480 East: 210 West: 390"
+  },
+  {
+    "page_idx": 1,
+    "bbox": [
+      117,
+      60,
+      686,
+      112
+    ],
+    "type": "text",
+    "text": "Figure 1: Q1 Sales by Region"
+  },
+  {
+    "page_idx": 1,
+    "bbox": [
+      306,
+      184,
+      1193,
+      1006
+    ],
+    "type": "image",
+    "img_path": "images/image_0.png"
+  },
+  {
+    "page_idx": 2,
+    "bbox": [
+      723,
+      148,
+      1257,
+      242
+    ],
+    "type": "text",
+    "text": "Conclusion",
+    "text_level": 1
+  },
+  {
+    "page_idx": 2,
+    "bbox": [
+      119,
+      386,
+      1763,
+      577
+    ],
+    "type": "text",
+    "text": "* South region leads Q1 with 480 units. North and West show steady growth."
+  }
+]
